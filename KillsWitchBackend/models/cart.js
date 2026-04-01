@@ -1,129 +1,41 @@
-module.exports = (sequelize, DataTypes) => {
-    const Cart = sequelize.define('Cart', {
-        id: {
-            type: DataTypes.INTEGER,
-            primaryKey: true,
-            autoIncrement: true
-        },
-        userId: {
-            type: DataTypes.INTEGER,
-            allowNull: false,
-            references: {
-                model: 'users',
-                key: 'id'
-            },
-            onUpdate: 'CASCADE',
-            onDelete: 'CASCADE'
-        },
-        sessionId: {
-            type: DataTypes.STRING(255),
-            allowNull: true,
-            comment: 'For guest users - stores session ID'
-        },
-        status: {
-            type: DataTypes.ENUM('active', 'abandoned', 'converted'),
-            defaultValue: 'active',
-            allowNull: false
-        },
-        totalItems: {
-            type: DataTypes.INTEGER,
-            defaultValue: 0,
-            allowNull: false,
-            validate: {
-                min: 0
-            }
-        },
-        totalAmount: {
-            type: DataTypes.DECIMAL(10, 2),
-            defaultValue: 0.00,
-            allowNull: false,
-            validate: {
-                min: 0
-            }
-        },
-        currency: {
-            type: DataTypes.STRING(3),
-            defaultValue: 'USD',
-            allowNull: false
-        },
-        notes: {
-            type: DataTypes.TEXT,
-            allowNull: true
-        },
-        expiresAt: {
-            type: DataTypes.DATE,
-            allowNull: true,
-            comment: 'Cart expiration date for cleanup'
-        }
-    }, {
-        tableName: 'carts',
-        timestamps: true,
-        indexes: [
-            {
-                fields: ['userId']
-            },
-            {
-                fields: ['sessionId']
-            },
-            {
-                fields: ['status']
-            },
-            {
-                fields: ['expiresAt']
-            },
-            {
-                fields: ['createdAt']
-            }
-        ]
-    });
+const { query, transaction } = require("../config/db");
 
-    Cart.associate = (models) => {
-        // A cart belongs to a user
-        Cart.belongsTo(models.User, {
-            foreignKey: 'userId',
-            as: 'user',
-            onDelete: 'CASCADE'
-        });
+class CartModel {
+  static async create(userId, sessionId) {
+    const { rows } = await query(
+      `INSERT INTO carts
+         (user_id, session_id, status, total_items, total_amount, currency, expires_at, created_at, updated_at)
+       VALUES ($1, $2, 'active', 0, 0.00, 'USD', NULL, NOW(), NOW())
+       RETURNING *`,
+      [userId || null, sessionId]
+    );
+    return rows[0];
+  }
 
-        // A cart has many cart items
-        Cart.hasMany(models.CartItem, {
-            foreignKey: 'cartId',
-            as: 'items',
-            onDelete: 'CASCADE'
-        });
-    };
+  static async findById(id) {
+    const { rows } = await query(`SELECT * FROM carts WHERE id = $1`, [id]);
+    return rows[0] || null;
+  }
 
-    // Instance methods
-    Cart.prototype.calculateTotals = async function() {
-        const items = await this.getItems();
-        let totalItems = 0;
-        let totalAmount = 0;
+  static async findBySession(sessionId) {
+    const { rows } = await query(`SELECT * FROM carts WHERE session_id = $1 AND status != 'converted'`, [sessionId]);
+    return rows[0] || null;
+  }
 
-        for (const item of items) {
-            totalItems += item.quantity;
-            totalAmount += item.quantity * item.price;
-        }
+  static async updateTotalAmount(cartId, totalItems, totalAmount) {
+    await query(
+      `UPDATE carts SET total_items = $1, total_amount = $2, updated_at = NOW() WHERE id = $3`,
+      [totalItems, totalAmount, cartId]
+    );
+  }
 
-        this.totalItems = totalItems;
-        this.totalAmount = totalAmount;
-        await this.save();
-        
-        return { totalItems, totalAmount };
-    };
+  static async setStatus(id, status) {
+    await query(`UPDATE carts SET status = $1, updated_at = NOW() WHERE id = $2`, [status, id]);
+  }
 
-    Cart.prototype.isEmpty = function() {
-        return this.totalItems === 0;
-    };
+  static async expireInactive() {
+    await query(`UPDATE carts SET status = 'abandoned', updated_at = NOW() WHERE status = 'active' AND created_at < NOW() - INTERVAL '30 minutes'`);
+  }
+}
 
-    Cart.prototype.clear = async function() {
-        const items = await this.getItems();
-        for (const item of items) {
-            await item.destroy();
-        }
-        this.totalItems = 0;
-        this.totalAmount = 0;
-        await this.save();
-    };
-
-    return Cart;
-};
+module.exports = { CartModel };

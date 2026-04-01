@@ -1,23 +1,24 @@
-const { brandcategory } = require(".");
+const { query } = require("../config/db");
 
+class BrandModel {
+  static async create(brandId, brandName) {
+    await query(
+      `INSERT INTO brands (brand_id, brand_name, created_at, updated_at)
+       VALUES ($1, $2, NOW(), NOW())
+       ON CONFLICT (brand_id) DO UPDATE SET brand_name = EXCLUDED.brand_name`,
+      [brandId, brandName]
+    );
+  }
 
-module.exports = (sequelize, DataTypes) => {
-    const brand = sequelize.define('brand',{
-        brand_id:{
-            type:DataTypes.INTEGER,
-            primaryKey:true,
-          //  autoIncrement: true
-        },
-        brand_name:{
-            type:DataTypes.STRING
-        }
-    });
+  static async findAll() {
+    const { rows } = await query(`SELECT * FROM brands ORDER BY brand_name`);
+    return rows;
+  }
 
-brand.associate = (models) => {
-        brand.hasMany(models.brandcategory, { foreignKey: 'brand_id', as: 'brandcategory' });
- };
+  static async findById(brandId) {
+    const { rows } = await query(`SELECT * FROM brands WHERE brand_id = $1`, [brandId]);
+    return rows[0] || null;
+  }
+}
 
-    
-          
-        return brand;
-    }
+module.exports = { BrandModel };

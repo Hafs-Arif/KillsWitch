@@ -7,7 +7,6 @@ const {
 } = require('../controllers/adminRequestController');
 const { auth, authorize } = require('../middleware/auth');
 
-// Admin request routes - admin only
 router.post('', auth, authorize(['admin']), createAdminRequest);
 router.put('/updateStatus', auth, authorize(['admin']), updateApprovalStatus);
 router.get('', auth, authorize(['admin']), findAllAdminRequests);

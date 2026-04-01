@@ -1,732 +1,355 @@
-const { Cart, CartItem, product, brandcategory, User } = require("../models");
-const { Op } = require("sequelize");
+// controllers/cartController.js  –  raw SQL (pg)
+"use strict";
 
-// Get or create user's or guest's active cart
+const { query, transaction } = require("../config/db");
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+async function recalcCart(tx, cartId) {
+  await tx(
+    `UPDATE carts
+     SET total_items  = (SELECT COALESCE(SUM(quantity), 0)             FROM cart_items WHERE cart_id = $1),
+         total_amount = (SELECT COALESCE(SUM(quantity * price), 0.00)  FROM cart_items WHERE cart_id = $1),
+         updated_at   = NOW()
+     WHERE id = $1`,
+    [cartId]
+  );
+}
+
+async function getOrCreateCartRecord(userId, sessionId, tx) {
+  const where  = userId ? "user_id = $1" : "session_id = $1";
+  const param  = userId || sessionId;
+  const { rows } = await tx(
+    `SELECT id FROM carts WHERE ${where} AND status = 'active' LIMIT 1`, [param]
+  );
+  if (rows.length) return rows[0].id;
+
+  const { rows: created } = await tx(
+    `INSERT INTO carts (user_id, session_id, status, total_items, total_amount, expires_at, created_at, updated_at)
+     VALUES ($1, $2, 'active', 0, 0.00, NOW() + INTERVAL '30 days', NOW(), NOW())
+     RETURNING id`,
+    [userId || null, sessionId || null]
+  );
+  return created[0].id;
+}
+
+function normalizeItems(items) {
+  return items.map(ci => ({
+    id:          ci.id,
+    cart_id:     ci.cart_id,
+    product_id:  ci.product_id,
+    quantity:    ci.quantity,
+    price:       ci.price,
+    total_price: ci.total_price,
+    notes:       ci.notes,
+    // product fields
+    product_part_number:       ci.part_number,
+    product_image:             ci.image,
+    product_price:             ci.price,
+    product_short_description: ci.short_description,
+    product_condition:         ci.condition,
+    product_status:            ci.status,
+    brand_name:                ci.brand_name,
+    category_name:             ci.category_name,
+    slug:                      ci.slug,
+    sale_price:                ci.sale_price,
+    video_url:                 ci.video_url,
+  }));
+}
+
+async function fetchCartWithItems(cartId) {
+  const { rows: [cart] } = await query(
+    "SELECT * FROM carts WHERE id = $1", [cartId]
+  );
+  if (!cart) return null;
+
+  const { rows: items } = await query(
+    `SELECT ci.*,
+            p.part_number, p.image, p.short_description, p.condition, p.status,
+            p.sale_price, p.video_url, p.slug,
+            b.brand_name,
+            c.category_name
+     FROM cart_items ci
+     LEFT JOIN products     p  ON p.product_id            = ci.product_id
+     LEFT JOIN brandcategory bc ON bc.id                  = p.brandcategory_id
+     LEFT JOIN brands        b  ON b.brand_id             = bc.brand_id
+     LEFT JOIN categories    c  ON c.product_category_id  = bc.category_id
+     WHERE ci.cart_id = $1`,
+    [cartId]
+  );
+
+  return { ...cart, items: normalizeItems(items) };
+}
+
+// ── Get or create cart ────────────────────────────────────────────────────────
 exports.getOrCreateCart = async (req, res) => {
+  const userId    = req.user?.id || null;
+  const sessionId = req.body?.sessionId || null;
+
+  if (!userId && !sessionId)
+    return res.status(400).json({ success: false, message: "Authentication or sessionId required" });
+
   try {
-    // Allow either authenticated user or guest sessionId in body
-    const userId = req.user && req.user.id ? req.user.id : null;
-    const { sessionId } = req.body; // For guest users
-
-    if (!userId && !sessionId) {
-      return res.status(400).json({
-        success: false,
-        message: "Authentication or sessionId required",
-      });
-    }
-
-    const where = { status: 'active' };
-    if (userId) where.userId = userId;
-    else where.sessionId = sessionId;
-
-    let cart = await Cart.findOne({
-      where,
-      include: [
-        {
-          model: CartItem,
-          as: 'items',
-          include: [
-            {
-              model: product,
-              as: 'product',
-              // include entire product record plus brandcategory details and images
-              include: [
-                {
-                  model: brandcategory,
-                  as: 'brandcategory',
-                  include: [
-                    { model: require('../models').brand, as: 'brand' },
-                    { model: require('../models').category, as: 'category' },
-                    { model: require('../models').subcategory, as: 'subcategory' }
-                  ]
-                },
-                {
-                  model: require('../models').ProductImage,
-                  as: 'images',
-                  attributes: ['id','url']
-                }
-              ]
-            }
-          ]
-        }
-      ]
+    let cartId;
+    await transaction(async (tx) => {
+      cartId = await getOrCreateCartRecord(userId, sessionId, tx);
+      await recalcCart(tx, cartId);
     });
-
-    if (!cart) {
-      cart = await Cart.create({
-        userId: userId,
-        sessionId: sessionId || null,
-        status: 'active',
-        expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // 30 days
-      });
-    }
-
-    // Calculate totals
-    await cart.calculateTotals();
-
-    // Normalize items to include frontend-friendly product_* fields
-    const cartJson = cart.toJSON ? cart.toJSON() : cart;
-    const normalizedItems = (cartJson.items || []).map(ci => {
-      const prod = ci.product || ci.productSnapshot || {};
-      return {
-        id: ci.id,
-        cartId: ci.cartId,
-        productId: ci.productId,
-        quantity: ci.quantity,
-        price: ci.price,
-        totalPrice: ci.totalPrice,
-        notes: ci.notes,
-        createdAt: ci.createdAt,
-        updatedAt: ci.updatedAt,
-        product_product_id: prod.product_id || ci.productId,
-        product_part_number: prod.part_number || prod.part_number || (prod.product_part_number || null),
-        product_image: prod.image || prod.product_image || (prod.product_image_url || null),
-        product_images: Array.isArray(prod.images) ? prod.images.map(i => i.url).filter(Boolean) : [],
-        video_url: prod.video_url || prod.videoUrl || null,
-        product_price: prod.price || ci.price,
-        product_short_description: prod.short_description || prod.product_short_description || null,
-        product_long_description: prod.long_description || prod.long_description || null,
-        product_condition: prod.condition || null,
-        product_sub_condition: prod.sub_condition || null,
-        product_status: prod.status || null,
-        slug: prod.slug || null,
-        product: prod
-      };
-    });
-
-    cartJson.items = normalizedItems;
-
-    res.json({
-      success: true,
-      data: cartJson
-    });
-  } catch (error) {
-    console.error("Get or create cart error:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Internal server error",
-      error: error.message 
-    });
+    return res.json({ success: true, data: await fetchCartWithItems(cartId) });
+  } catch (err) {
+    console.error("getOrCreateCart:", err.message);
+    return res.status(500).json({ success: false, message: "Internal server error" });
   }
 };
 
-// Add item to cart (supports authenticated user or guest via sessionId)
-exports.addToCart = async (req, res) => {
-  try {
-    const userId = req.user && req.user.id ? req.user.id : null;
-    const { sessionId, productId, quantity = 1, notes } = req.body;
-
-    console.log('🛒 Add to cart request:', { userId, sessionId, productId, quantity });
-
-    // Validate input
-    if (!productId || quantity < 1) {
-      return res.status(400).json({
-        success: false,
-        message: "Product ID and valid quantity are required"
-      });
-    }
-
-    // Check if product exists and is available
-    const productData = await product.findByPk(productId);
-    console.log('📦 Product lookup result:', { 
-      found: !!productData, 
-      productId,
-      status: productData?.status,
-      quantity: productData?.quantity 
-    });
-    
-    if (!productData) {
-      console.warn('❌ Product not found:', productId);
-      return res.status(404).json({
-        success: false,
-        message: "Product not found"
-      });
-    }
-
-    if (productData.status !== 'active') {
-      console.warn('❌ Product not available:', { productId, status: productData.status });
-      console.warn('📌 Note: Checking if product should be made available. Status values in DB might not be standardized.');
-      // For now, allow products even if status is not exactly 'active'
-      // This is a temporary measure - ideally all products should have status='active'
-      if (!productData.status) {
-        console.warn('⚠️ Product status is NULL/undefined - this might be a data issue');
-        // Allow it to proceed anyway
-      }
-      // Uncomment the next line to strictly enforce status='active'
-      // return res.status(400).json({ success: false, message: "Product is not available for purchase" });
-    }
-
-    if (productData.quantity < quantity) {
-      console.warn('❌ Insufficient stock:', { productId, available: productData.quantity, requested: quantity });
-      // Allow adding to cart anyway - order validation can happen at checkout
-      console.log('📌 Note: Allowing cart addition despite stock warning');
-      // Uncomment next line to enforce strict stock checking
-      // return res.status(400).json({ success: false, message: `Only ${productData.quantity} items available in stock` });
-    }
-
-    // Get or create cart (by userId or sessionId)
-    let cart;
-    if (userId) {
-      cart = await Cart.findOne({ where: { userId: userId, status: 'active' } });
-    } else {
-      if (!sessionId) {
-        return res.status(400).json({ success: false, message: 'sessionId is required for guest cart' });
-      }
-      cart = await Cart.findOne({ where: { sessionId: sessionId, status: 'active' } });
-    }
-
-    if (!cart) {
-      cart = await Cart.create({
-        userId: userId,
-        sessionId: sessionId || null,
-        status: 'active',
-        expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
-      });
-    }
-
-    // Check if item already exists in cart
-    let cartItem = await CartItem.findOne({
-      where: {
-        cartId: cart.id,
-        productId: productId
-      }
-    });
-
-    if (cartItem) {
-      // Update existing item
-      const newQuantity = cartItem.quantity + quantity;
-      if (newQuantity > productData.quantity) {
-        return res.status(400).json({
-          success: false,
-          message: `Cannot add ${quantity} more items. Only ${productData.quantity - cartItem.quantity} available`
-        });
-      }
-      
-      await cartItem.updateQuantity(newQuantity);
-      if (notes) cartItem.notes = notes;
-      await cartItem.save();
-    } else {
-      // Create new cart item - ensure totalPrice is provided (fallback computed in model hooks)
-      const price = productData.price || 0;
-      const totalPrice = Number(quantity) * Number(price);
-      cartItem = await CartItem.create({
-        cartId: cart.id,
-        productId: productId,
-        quantity: quantity,
-        price: price,
-        totalPrice: totalPrice,
-        notes: notes
-      });
-    }
-
-    // Recalculate cart totals
-    await cart.calculateTotals();
-
-    // Fetch updated cart with items
-    const updatedCart = await Cart.findByPk(cart.id, {
-      include: [
-        {
-          model: CartItem,
-          as: 'items',
-          include: [
-            {
-              model: product,
-              as: 'product',
-              attributes: ['product_id', 'part_number', 'short_description', 'image', 'price', 'status', 'quantity']
-            }
-          ]
-        }
-      ]
-    });
-
-    // Normalize updated cart items for frontend
-    const updatedJson = updatedCart.toJSON ? updatedCart.toJSON() : updatedCart;
-    const normalizedUpdatedItems = (updatedJson.items || []).map(ci => {
-      const prod = ci.product || ci.productSnapshot || {};
-      return {
-        id: ci.id,
-        cartId: ci.cartId,
-        productId: ci.productId,
-        quantity: ci.quantity,
-        price: ci.price,
-        totalPrice: ci.totalPrice,
-        notes: ci.notes,
-        createdAt: ci.createdAt,
-        updatedAt: ci.updatedAt,
-        product_product_id: prod.product_id || ci.productId,
-        product_part_number: prod.part_number || prod.part_number || (prod.product_part_number || null),
-        product_image: prod.image || prod.product_image || (prod.product_image_url || null),
-        product_images: Array.isArray(prod.images) ? prod.images.map(i => i.url).filter(Boolean) : [],
-        video_url: prod.video_url || prod.videoUrl || null,
-        product_price: prod.price || ci.price,
-        product_short_description: prod.short_description || prod.product_short_description || null,
-        product_long_description: prod.long_description || prod.long_description || null,
-        product_condition: prod.condition || null,
-        product_sub_condition: prod.sub_condition || null,
-        product_status: prod.status || null,
-        slug: prod.slug || null,
-        product: prod
-      };
-    });
-
-    updatedJson.items = normalizedUpdatedItems;
-    updatedJson.items = updatedJson.items.map(item => ({
-      ...item,
-      category_category_name: item.category_category_name || item.product?.category?.category_name || item.product?.brandcategory?.category?.category_name || null,
-      brand_name: item.brand_name || item.product?.brandcategory?.brand?.brand_name || null
-    }));
-
-    res.json({
-      success: true,
-      message: "Item added to cart successfully",
-      data: updatedJson
-    });
-  } catch (error) {
-    console.error("Add to cart error:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Internal server error",
-      error: error.message 
-    });
-  }
-};
-
-// Update cart item quantity
-exports.updateCartItem = async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { itemId } = req.params;
-    const { quantity, notes } = req.body;
-
-    if (!quantity || quantity < 1) {
-      return res.status(400).json({
-        success: false,
-        message: "Valid quantity is required"
-      });
-    }
-
-    // Find cart item
-    const cartItem = await CartItem.findOne({
-      where: {
-        id: itemId
-      },
-      include: [
-        {
-          model: Cart,
-          as: 'cart',
-          where: {
-            userId: userId,
-            status: 'active'
-          }
-        },
-        {
-          model: product,
-          as: 'product'
-        }
-      ]
-    });
-
-    if (!cartItem) {
-      return res.status(404).json({
-        success: false,
-        message: "Cart item not found"
-      });
-    }
-
-    // Check stock availability
-    if (quantity > cartItem.product.quantity) {
-      return res.status(400).json({
-        success: false,
-        message: `Only ${cartItem.product.quantity} items available in stock`
-      });
-    }
-
-    // Update quantity
-    await cartItem.updateQuantity(quantity);
-    if (notes !== undefined) {
-      cartItem.notes = notes;
-      await cartItem.save();
-    }
-
-    // Recalculate cart totals
-    await cartItem.cart.calculateTotals();
-
-    res.json({
-      success: true,
-      message: "Cart item updated successfully",
-      data: cartItem
-    });
-  } catch (error) {
-    console.error("Update cart item error:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Internal server error",
-      error: error.message 
-    });
-  }
-};
-
-// Remove item from cart
-exports.removeFromCart = async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { itemId } = req.params;
-
-    // Find cart item
-    const cartItem = await CartItem.findOne({
-      where: {
-        id: itemId
-      },
-      include: [
-        {
-          model: Cart,
-          as: 'cart',
-          where: {
-            userId: userId,
-            status: 'active'
-          }
-        }
-      ]
-    });
-
-    if (!cartItem) {
-      return res.status(404).json({
-        success: false,
-        message: "Cart item not found"
-      });
-    }
-
-    const cartId = cartItem.cartId;
-    await cartItem.destroy();
-
-    // Recalculate cart totals
-    const cart = await Cart.findByPk(cartId);
-    await cart.calculateTotals();
-
-    res.json({
-      success: true,
-      message: "Item removed from cart successfully"
-    });
-  } catch (error) {
-    console.error("Remove from cart error:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Internal server error",
-      error: error.message 
-    });
-  }
-};
-
-// Get cart contents
+// ── Get cart (authenticated) ──────────────────────────────────────────────────
 exports.getCart = async (req, res) => {
   try {
-    // Check if user is authenticated
-    if (!req.user || !req.user.id) {
-      return res.status(401).json({
-        success: false,
-        message: "Authentication required",
-        error: "User not authenticated"
-      });
-    }
+    const { rows } = await query(
+      "SELECT id FROM carts WHERE user_id = $1 AND status = 'active' LIMIT 1",
+      [req.user.id]
+    );
+    if (!rows.length) return res.json({ success: true, data: { total_items: 0, total_amount: 0, items: [] } });
 
-    const userId = req.user.id;
-
-    const cart = await Cart.findOne({
-      where: {
-        userId: userId,
-        status: 'active'
-      },
-      include: [
-        {
-          model: CartItem,
-          as: 'items',
-          include: [
-            {
-              model: product,
-              as: 'product',
-              include: [
-                {
-                  model: brandcategory,
-                  as: 'brandcategory',
-                  include: [
-                    { model: require('../models').brand, as: 'brand' },
-                    { model: require('../models').category, as: 'category' },
-                    { model: require('../models').subcategory, as: 'subcategory' }
-                  ]
-                },
-                {
-                  model: require('../models').ProductImage,
-                  as: 'images',
-                  attributes: ['id','url']
-                }
-              ]
-            }
-          ]
-        }
-      ]
-    });
-
-    if (!cart) {
-      return res.json({
-        success: true,
-        data: {
-          id: null,
-          totalItems: 0,
-          totalAmount: 0,
-          items: []
-        }
-      });
-    }
-
-    // Recalculate totals
-    await cart.calculateTotals();
-
-    // normalize items
-    const cartJson = cart.toJSON ? cart.toJSON() : cart;
-    const normalizedItems = (cartJson.items || []).map(ci => {
-      const prod = ci.product || ci.productSnapshot || {};
-      return {
-        id: ci.id,
-        cartId: ci.cartId,
-        productId: ci.productId,
-        quantity: ci.quantity,
-        price: ci.price,
-        totalPrice: ci.totalPrice,
-        notes: ci.notes,
-        createdAt: ci.createdAt,
-        updatedAt: ci.updatedAt,
-        product_product_id: prod.product_id || ci.productId,
-        product_part_number: prod.part_number || prod.part_number || (prod.product_part_number || null),
-        product_image: prod.image || prod.product_image || (prod.product_image_url || null),
-        product_images: Array.isArray(prod.images) ? prod.images.map(i => i.url).filter(Boolean) : [],
-        video_url: prod.video_url || prod.videoUrl || null,
-        product_price: prod.price || ci.price,
-        sale_price: prod.sale_price || null,
-        slug: prod.slug || null,
-        product_short_description: prod.short_description || prod.product_short_description || null,
-        product_long_description: prod.long_description || prod.long_description || null,
-        product_condition: prod.condition || null,
-        product_sub_condition: prod.sub_condition || null,
-        product_status: prod.status || null,
-        product: prod
-      };
-    });
-    cartJson.items = normalizedItems;
-    cartJson.items = cartJson.items.map(item => ({
-      ...item,
-      category_category_name: item.category_category_name || item.product?.category?.category_name || item.product?.brandcategory?.category?.category_name || null,
-      brand_name: item.brand_name || item.product?.brandcategory?.brand?.brand_name || null
-    }));
-
-    res.json({
-      success: true,
-      data: cartJson
-    });
-  } catch (error) {
-    console.error("Get cart error:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Internal server error",
-      error: error.message 
-    });
+    const cart = await fetchCartWithItems(rows[0].id);
+    return res.json({ success: true, data: cart });
+  } catch (err) {
+    console.error("getCart:", err.message);
+    return res.status(500).json({ success: false, message: "Internal server error" });
   }
 };
 
-// Clear entire cart
-exports.clearCart = async (req, res) => {
-  try {
-    const userId = req.user.id;
-
-    const cart = await Cart.findOne({
-      where: {
-        userId: userId,
-        status: 'active'
-      }
-    });
-
-    if (!cart) {
-      return res.status(404).json({
-        success: false,
-        message: "Cart not found"
-      });
-    }
-
-    await cart.clear();
-
-    res.json({
-      success: true,
-      message: "Cart cleared successfully"
-    });
-  } catch (error) {
-    console.error("Clear cart error:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Internal server error",
-      error: error.message 
-    });
-  }
-};
-
-// Get cart summary (for header/mini cart)
+// ── Get cart summary ──────────────────────────────────────────────────────────
 exports.getCartSummary = async (req, res) => {
   try {
-    // Check if user is authenticated
-    if (!req.user || !req.user.id) {
-      return res.status(401).json({
-        success: false,
-        message: "Authentication required",
-        error: "User not authenticated"
-      });
-    }
+    const { rows } = await query(
+      `SELECT c.id, c.total_items, c.total_amount
+       FROM carts c WHERE c.user_id = $1 AND c.status = 'active' LIMIT 1`,
+      [req.user.id]
+    );
+    if (!rows.length) return res.json({ success: true, data: { total_items: 0, total_amount: 0, items: [] } });
 
-    const userId = req.user.id;
+    const cartId = rows[0].id;
+    const { rows: items } = await query(
+      `SELECT ci.id, ci.quantity, ci.price, ci.total_price,
+              p.part_number, p.image
+       FROM cart_items ci
+       LEFT JOIN products p ON p.product_id = ci.product_id
+       WHERE ci.cart_id = $1
+       LIMIT 3`,
+      [cartId]
+    );
 
-    const cart = await Cart.findOne({
-      where: {
-        userId: userId,
-        status: 'active'
-      },
-      include: [
-        {
-          model: CartItem,
-          as: 'items',
-          attributes: ['id', 'quantity', 'price', 'totalPrice'],
-          include: [
-            {
-              model: product,
-              as: 'product',
-              attributes: ['product_id', 'part_number', 'short_description', 'image']
-            }
-          ]
-        }
-      ]
-    });
+    const { rows: total } = await query("SELECT COUNT(*) AS n FROM cart_items WHERE cart_id = $1", [cartId]);
 
-    if (!cart) {
-      return res.json({
-        success: true,
-        data: {
-          totalItems: 0,
-          totalAmount: 0,
-          items: []
-        }
-      });
-    }
-
-    // Recalculate totals
-    await cart.calculateTotals();
-
-    res.json({
+    return res.json({
       success: true,
       data: {
-        totalItems: cart.totalItems,
-        totalAmount: cart.totalAmount,
-        items: cart.items.slice(0, 3), // Show only first 3 items for summary
-        hasMore: cart.items.length > 3
-      }
+        total_items:  rows[0].total_items,
+        total_amount: rows[0].total_amount,
+        items,
+        hasMore: parseInt(total[0].n, 10) > 3,
+      },
     });
-  } catch (error) {
-    console.error("Get cart summary error:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Internal server error",
-      error: error.message 
-    });
+  } catch (err) {
+    console.error("getCartSummary:", err.message);
+    return res.status(500).json({ success: false, message: "Internal server error" });
   }
 };
 
-// Merge guest cart with user cart (for login)
-exports.mergeCarts = async (req, res) => {
+// ── Add item to cart ──────────────────────────────────────────────────────────
+exports.addToCart = async (req, res) => {
+  const userId    = req.user?.id || null;
+  const { sessionId, productId, quantity = 1, notes } = req.body;
+
+  if (!productId || quantity < 1)
+    return res.status(400).json({ success: false, message: "productId and valid quantity required" });
+
   try {
-    const userId = req.user.id;
-    const { guestSessionId } = req.body;
+    const { rows: prods } = await query(
+      "SELECT product_id, price, quantity AS stock FROM products WHERE product_id = $1",
+      [parseInt(productId, 10)]
+    );
+    if (!prods.length) return res.status(404).json({ success: false, message: "Product not found" });
+    const product = prods[0];
 
-    if (!guestSessionId) {
-      return res.status(400).json({
-        success: false,
-        message: "Guest session ID is required"
-      });
-    }
+    await transaction(async (tx) => {
+      const cartId = await getOrCreateCartRecord(userId, sessionId, tx);
 
-    // Find guest cart
-    const guestCart = await Cart.findOne({
-      where: {
-        sessionId: guestSessionId,
-        status: 'active'
-      },
-      include: [
-        {
-          model: CartItem,
-          as: 'items'
-        }
-      ]
-    });
+      const { rows: existing } = await tx(
+        "SELECT id, quantity FROM cart_items WHERE cart_id = $1 AND product_id = $2",
+        [cartId, product.product_id]
+      );
 
-    if (!guestCart || guestCart.items.length === 0) {
-      return res.json({
-        success: true,
-        message: "No guest cart items to merge"
-      });
-    }
+      if (existing.length) {
+        const newQty = existing[0].quantity + parseInt(quantity, 10);
+        if (newQty > product.stock)
+          throw Object.assign(new Error(`Only ${product.stock - existing[0].quantity} more available`), { status: 400 });
 
-    // Find or create user cart
-    let userCart = await Cart.findOne({
-      where: {
-        userId: userId,
-        status: 'active'
-      }
-    });
-
-    if (!userCart) {
-      userCart = await Cart.create({
-        userId: userId,
-        status: 'active',
-        expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
-      });
-    }
-
-    // Merge items
-    for (const guestItem of guestCart.items) {
-      const existingItem = await CartItem.findOne({
-        where: {
-          cartId: userCart.id,
-          productId: guestItem.productId
-        }
-      });
-
-      if (existingItem) {
-        // Update quantity
-        await existingItem.increaseQuantity(guestItem.quantity);
+        await tx(
+          `UPDATE cart_items SET quantity=$1, total_price=$2, updated_at=NOW() WHERE id=$3`,
+          [newQty, newQty * product.price, existing[0].id]
+        );
       } else {
-        // Create new item
-        await CartItem.create({
-          cartId: userCart.id,
-          productId: guestItem.productId,
-          quantity: guestItem.quantity,
-          price: guestItem.price,
-          notes: guestItem.notes
-        });
+        const qty = parseInt(quantity, 10);
+        await tx(
+          `INSERT INTO cart_items (cart_id, product_id, quantity, price, total_price, notes, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,NOW(),NOW())`,
+          [cartId, product.product_id, qty, product.price, qty * product.price, notes || null]
+        );
       }
-    }
 
-    // Clear guest cart
-    await guestCart.clear();
-    await guestCart.destroy();
-
-    // Recalculate user cart totals
-    await userCart.calculateTotals();
-
-    res.json({
-      success: true,
-      message: "Carts merged successfully",
-      data: userCart
+      await recalcCart(tx, cartId);
     });
-  } catch (error) {
-    console.error("Merge carts error:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Internal server error",
-      error: error.message 
+
+    return res.json({ success: true, message: "Item added to cart" });
+  } catch (err) {
+    if (err.status === 400) return res.status(400).json({ success: false, message: err.message });
+    console.error("addToCart:", err.message);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
+};
+
+// ── Update cart item quantity ─────────────────────────────────────────────────
+exports.updateCartItem = async (req, res) => {
+  const itemId  = parseInt(req.params.itemId, 10);
+  const { quantity, notes } = req.body;
+
+  if (!quantity || quantity < 1)
+    return res.status(400).json({ success: false, message: "Valid quantity required" });
+
+  try {
+    await transaction(async (tx) => {
+      // Verify item belongs to this user's active cart
+      const { rows } = await tx(
+        `SELECT ci.id, ci.price, c.id AS cart_id, p.quantity AS stock
+         FROM cart_items ci
+         JOIN carts    c ON c.id          = ci.cart_id AND c.user_id = $1 AND c.status = 'active'
+         JOIN products p ON p.product_id  = ci.product_id
+         WHERE ci.id = $2`,
+        [req.user.id, itemId]
+      );
+      if (!rows.length) throw Object.assign(new Error("Cart item not found"), { status: 404 });
+
+      const item = rows[0];
+      if (quantity > item.stock)
+        throw Object.assign(new Error(`Only ${item.stock} in stock`), { status: 400 });
+
+      const sets = ["quantity=$1", "total_price=$2", "updated_at=NOW()"];
+      const vals = [quantity, quantity * item.price];
+      if (notes !== undefined) { sets.push(`notes=$${vals.length + 1}`); vals.push(notes); }
+      vals.push(itemId);
+
+      await tx(`UPDATE cart_items SET ${sets.join(",")} WHERE id=$${vals.length}`, vals);
+      await recalcCart(tx, item.cart_id);
     });
+
+    return res.json({ success: true, message: "Cart item updated" });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ success: false, message: err.message });
+    console.error("updateCartItem:", err.message);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
+};
+
+// ── Remove item from cart ─────────────────────────────────────────────────────
+exports.removeFromCart = async (req, res) => {
+  const itemId = parseInt(req.params.itemId, 10);
+
+  try {
+    await transaction(async (tx) => {
+      const { rows } = await tx(
+        `SELECT ci.cart_id FROM cart_items ci
+         JOIN carts c ON c.id = ci.cart_id AND c.user_id = $1 AND c.status = 'active'
+         WHERE ci.id = $2`,
+        [req.user.id, itemId]
+      );
+      if (!rows.length) throw Object.assign(new Error("Cart item not found"), { status: 404 });
+
+      const cartId = rows[0].cart_id;
+      await tx("DELETE FROM cart_items WHERE id = $1", [itemId]);
+      await recalcCart(tx, cartId);
+    });
+
+    return res.json({ success: true, message: "Item removed" });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ success: false, message: err.message });
+    console.error("removeFromCart:", err.message);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
+};
+
+// ── Clear entire cart ─────────────────────────────────────────────────────────
+exports.clearCart = async (req, res) => {
+  try {
+    const { rows } = await query(
+      "SELECT id FROM carts WHERE user_id = $1 AND status = 'active' LIMIT 1",
+      [req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ success: false, message: "Cart not found" });
+
+    await transaction(async (tx) => {
+      await tx("DELETE FROM cart_items WHERE cart_id = $1", [rows[0].id]);
+      await recalcCart(tx, rows[0].id);
+    });
+
+    return res.json({ success: true, message: "Cart cleared" });
+  } catch (err) {
+    console.error("clearCart:", err.message);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
+};
+
+// ── Merge guest cart into user cart ──────────────────────────────────────────
+exports.mergeCarts = async (req, res) => {
+  const { guestSessionId } = req.body;
+  if (!guestSessionId) return res.status(400).json({ success: false, message: "guestSessionId required" });
+
+  try {
+    await transaction(async (tx) => {
+      const { rows: guestRows } = await tx(
+        "SELECT id FROM carts WHERE session_id = $1 AND status = 'active' LIMIT 1",
+        [guestSessionId]
+      );
+      if (!guestRows.length) return; // nothing to merge
+
+      const guestCartId = guestRows[0].id;
+      const { rows: guestItems } = await tx(
+        "SELECT * FROM cart_items WHERE cart_id = $1", [guestCartId]
+      );
+      if (!guestItems.length) return;
+
+      const userCartId = await getOrCreateCartRecord(req.user.id, null, tx);
+
+      for (const gi of guestItems) {
+        const { rows: existing } = await tx(
+          "SELECT id, quantity FROM cart_items WHERE cart_id = $1 AND product_id = $2",
+          [userCartId, gi.product_id]
+        );
+        if (existing.length) {
+          const newQty = existing[0].quantity + gi.quantity;
+          await tx(
+            "UPDATE cart_items SET quantity=$1, total_price=$2, updated_at=NOW() WHERE id=$3",
+            [newQty, newQty * gi.price, existing[0].id]
+          );
+        } else {
+          await tx(
+            `INSERT INTO cart_items (cart_id, product_id, quantity, price, total_price, notes, created_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,NOW(),NOW())`,
+            [userCartId, gi.product_id, gi.quantity, gi.price, gi.total_price, gi.notes]
+          );
+        }
+      }
+
+      // Delete guest cart
+      await tx("DELETE FROM cart_items WHERE cart_id = $1", [guestCartId]);
+      await tx("DELETE FROM carts WHERE id = $1", [guestCartId]);
+      await recalcCart(tx, userCartId);
+    });
+
+    return res.json({ success: true, message: "Carts merged" });
+  } catch (err) {
+    console.error("mergeCarts:", err.message);
+    return res.status(500).json({ success: false, message: "Internal server error" });
   }
 };

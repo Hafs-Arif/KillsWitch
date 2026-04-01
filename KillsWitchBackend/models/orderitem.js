@@ -1,59 +1,41 @@
-module.exports = (sequelize, DataTypes) => {
-    const OrderItem = sequelize.define('OrderItem', {
-      order_item_id: {
-        type: DataTypes.INTEGER,
-        autoIncrement: true,
-        primaryKey: true
-      },
-      quantity: {
-        type: DataTypes.INTEGER,
-        allowNull: false
-      },
-      condition: {
-        type: DataTypes.STRING,
-        defaultValue: 'NEW'
-      },
-      isFullCart: {
-        type: DataTypes.BOOLEAN,
-        allowNull: true
-      },
-      price: {
-        type: DataTypes.DECIMAL(10, 2),
-        allowNull: false
-      },
-      productName: {
-        type: DataTypes.STRING,
-        allowNull: false
-      },
-      orderId: {
-        type: DataTypes.INTEGER,
-        allowNull: false,
-      },
-      productId: {
-        type: DataTypes.INTEGER,
-        allowNull: false,
-      },
-    }, {
-      tableName: 'order_items',
-      timestamps: true,
-      createdAt: 'created_at',
-      updatedAt: 'updated_at'
+const { query, transaction } = require("../config/db");
+
+class OrderItemModel {
+  static async bulkCreate(orderId, items) {
+    if (!items.length) return;
+
+    await transaction(async (tx) => {
+      const valuePlaceholders = [];
+      const vals = [];
+      let idx = 1;
+
+      for (const item of items) {
+        valuePlaceholders.push(
+          `($${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, NOW(), NOW())`
+        );
+        vals.push(
+          orderId,
+          item.productId,
+          item.productName,
+          parseFloat(item.price),
+          parseInt(item.quantity, 10) || 1,
+          item.condition || "USED"
+        );
+      }
+
+      await tx(
+        `INSERT INTO order_items
+           (order_id, product_id, product_name, price, quantity, condition, created_at, updated_at)
+         VALUES ${valuePlaceholders.join(", ")}`,
+        vals
+      );
     });
-  
-    OrderItem.associate = (models) => {
-      OrderItem.belongsTo(models.Order, {
-        foreignKey: 'orderId',
-        as: 'order',
-        onDelete: 'CASCADE'
-      });
-  
-      OrderItem.belongsTo(models.product, {
-        foreignKey: 'productId',
-        as: 'product',
-        onDelete: 'CASCADE'
-      });
-    };
-  
-    return OrderItem;
-  };
-  
+  }
+
+  static async findByOrderId(orderId) {
+    const { rows } = await query(`SELECT * FROM order_items WHERE order_id = $1`, [orderId]);
+    return rows;
+  }
+}
+
+module.exports = { OrderItemModel };

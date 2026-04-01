@@ -1,49 +1,32 @@
-module.exports = (sequelize, DataTypes) => {
-  const ActivityLog = sequelize.define(
-    "ActivityLog",
-    {
-      activity_logs_id: {
-        type: DataTypes.INTEGER,
-        autoIncrement: true,
-        primaryKey: true,
-      },
-      activity: {
-        type: DataTypes.TEXT,
-        allowNull: false,
-      },
-      user_email: {
-        type: DataTypes.STRING,
-        allowNull: true,
-      },
-      order_id: {
-        type: DataTypes.INTEGER,
-        allowNull: true,
-      },
-      details: {
-        type: DataTypes.JSONB,
-        allowNull: true,
-      },
-    },
-    {
-      tableName: "activity_logs",
-      timestamps: true,
-      createdAt: "created_at",
-      updatedAt: "updated_at",
-    }
-  );
+// models/activityLogModel.js
+const { query } = require("../config/db");
 
-  ActivityLog.associate = (models) => {
-    ActivityLog.belongsTo(models.Order, {
-      foreignKey: "order_id",
-      as: "order",
-    });
+class ActivityLogModel {
+  static async create(activity, userEmail, details, orderId = null) {
+    return query(
+      `INSERT INTO activity_logs
+         (activity, user_email, details, order_id, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, NOW(), NOW())
+       RETURNING *`,
+      [activity, userEmail || null, JSON.stringify(details), orderId]
+    );
+  }
 
-    ActivityLog.belongsTo(models.User, {
-      foreignKey: "user_email", // FK in ActivityLog
-      targetKey: "email", // maps to User.email
-      as: "user",
-    });
-  };
+  static async findByOrder(orderId) {
+    const { rows } = await query(
+      `SELECT * FROM activity_logs WHERE order_id = $1 ORDER BY created_at DESC`,
+      [orderId]
+    );
+    return rows;
+  }
 
-  return ActivityLog;
-};
+  static async findAll(limit = 100, offset = 0) {
+    const { rows } = await query(
+      `SELECT * FROM activity_logs ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+    return rows;
+  }
+}
+
+module.exports = { ActivityLogModel };

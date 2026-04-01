@@ -1,1388 +1,463 @@
-// controllers/orderController.js
-const {
-  User,
-  Shipment,
-  Payment,
-  Order,
-  OrderItem,
-  Cart,
-  ActivityLog,
-  product,
-  ProductImage,
-  brandcategory,
-  brand,
-  category,
-  subcategory,
-  Address,
-  Coupon,
-} = require("../models"); // Import models
-const { Op } = require("sequelize"); // Import Sequelize operators
+"use strict";
+
 const bcrypt = require("bcrypt");
-const PDFDocument = require('pdfkit');
-const { sendEmail } = require("../utils/email");
+const crypto = require("crypto");
+const PDFDocument = require("pdfkit");
+
+const { query, transaction }        = require("../config/db");
+const { sendEmail }                 = require("../utils/email");
 const { orderConfirmationTemplate, orderStatusUpdateTemplate } = require("../utils/emailTemplates");
 
-// Checkout controller method (with secure coupon handling)
-const checkout = async (req, res, next) => {
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+const trackingNumber = () => `TRK${Date.now().toString().slice(-8)}${Math.floor(Math.random()*1000).toString().padStart(3,"0")}`;
+const orderId        = () => `ORD-${Date.now()}-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
+
+// ── Checkout ──────────────────────────────────────────────────────────────────
+
+const checkout = async (req, res) => {
   try {
-    console.log('=== CHECKOUT REQUEST ===');
-    console.log('Payment method:', req.body.payment_method);
-    console.log('Request body keys:', Object.keys(req.body));
-    console.log('Order details:', req.body.orderDetails);
-    
-    // Validate required fields
-    if (!req.body.email) {
-      return res.status(400).json({ success: false, message: 'Email is required' });
-    }
-    
-    if (!req.body.orderDetails || !req.body.orderDetails.items || req.body.orderDetails.items.length === 0) {
-      return res.status(400).json({ success: false, message: 'Order items are required' });
-    }
-    
-    // Find or create the user
-    let user = await User.findOne({ where: { email: req.body.email } });
+    const {
+      email, password, name, phoneNumber, payment_method = "card",
+      shippingName, shippingAddress, shippingCity, shippingState,
+      shippingCountry, shippingPhone, shippingCompany,
+      billingName,  billingAddress,  billingCity,  billingState,
+      billingCountry, billingPhone, billingCompany,
+      orderDetails = {},
+    } = req.body;
 
-    if (!user) {
-      const hashedpass = await bcrypt.hash(req.body.password, 10);
-      user = await User.create({
-        name: req.body.name,
-        phoneno: req.body.phoneNumber,
-        email: req.body.email,
-        password: hashedpass,
-      });
-    }
-    console.log(`User created: ${user.name}`);
+    if (!email)                                   return res.status(400).json({ message: "Email required" });
+    if (!orderDetails?.items?.length)             return res.status(400).json({ message: "Order items required" });
+    if (!shippingName || !shippingAddress)        return res.status(400).json({ message: "Shipping info required" });
 
-    // Create shipment record
-    const shipment = await Shipment.create({
-      shippingAddress: req.body.shippingAddress,
-      shippingCity: req.body.shippingCity,
-      shippingCountry: req.body.shippingCountry,
-      shippingState: req.body.shippingState,
-      shippingCompany: req.body.shippingCompany,
-      shippingPhone: req.body.shippingPhone,
-      shippingName: req.body.shippingName,
-      billingName: req.body.billingName,
-      billingAddress: req.body.billingAddress,
-      billingCity: req.body.billingCity,
-      billingState: req.body.billingState,
-      billingCompany: req.body.billingCompany,
-      billingPhone: req.body.billingPhone,
-      billingCountry: req.body.billingCountry,
+    // ── Validate items & re-compute totals server-side ─────────────────────
+    const items     = orderDetails.items;
+    const shipping  = Number(orderDetails.shipping) || 0;
+    const TAX_RATE  = 0.2;
+
+    // Fetch product prices from DB (never trust client prices)
+    const productIds    = items.map(i => i.id);
+    const placeholders  = productIds.map((_, n) => `$${n + 1}`).join(",");
+    const { rows: products } = await query(
+      `SELECT product_id, price, quantity, part_number FROM products WHERE product_id IN (${placeholders})`,
+      productIds
+    );
+    const productMap = Object.fromEntries(products.map(p => [p.product_id, p]));
+
+    // Stock validation
+    for (const item of items) {
+      const p = productMap[item.id];
+      if (!p)            return res.status(400).json({ message: `Product ${item.id} not found` });
+      if (p.quantity < item.quantity)
+        return res.status(400).json({ message: `Insufficient stock for ${p.part_number}. Available: ${p.quantity}` });
+    }
+
+    // Coupon validation
+    let discount = 0;
+    let couponCode = null;
+    if (orderDetails.couponCode) {
+      const code = String(orderDetails.couponCode).trim().toUpperCase();
+      const { rows: coupons } = await query(
+        `SELECT * FROM coupons WHERE code = $1 AND is_active = true
+         AND (expires_at IS NULL OR expires_at > NOW())
+         AND (max_uses IS NULL OR uses_count < max_uses)`,
+        [code]
+      );
+      if (coupons.length) {
+        const c = coupons[0];
+        const subtotalForCoupon = items.reduce((s, i) => s + (productMap[i.id]?.price || 0) * i.quantity, 0);
+        if (!c.min_purchase_amount || subtotalForCoupon >= c.min_purchase_amount) {
+          discount   = c.discount_type === "percentage"
+            ? +(subtotalForCoupon * c.discount_value / 100).toFixed(2)
+            : +c.discount_value;
+          discount   = Math.min(discount, subtotalForCoupon);
+          couponCode = c.code;
+        }
+      }
+    }
+
+    const subtotal      = items.reduce((s, i) => s + (productMap[i.id]?.price || 0) * i.quantity, 0);
+    const taxableBase   = Math.max(0, subtotal - discount);
+    const tax           = +(taxableBase * TAX_RATE).toFixed(2);
+    const totalPrice    = +(taxableBase + shipping + tax).toFixed(2);
+    const orderIdStr    = orderId();
+    const trackNum      = trackingNumber();
+
+    await transaction(async (tx) => {
+      // Find or create user
+      let { rows: userRows } = await tx("SELECT id, email, name FROM users WHERE email = $1", [email.toLowerCase()]);
+      let userId;
+      if (!userRows.length) {
+        const hashed = await bcrypt.hash(password || crypto.randomBytes(16).toString("hex"), 12);
+        const { rows: newUser } = await tx(
+          `INSERT INTO users (name, email, password, phoneno, role, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, 'user', NOW(), NOW()) RETURNING id`,
+          [name || shippingName, email.toLowerCase(), hashed, phoneNumber || null]
+        );
+        userId = newUser[0].id;
+      } else {
+        userId = userRows[0].id;
+      }
+
+      // Shipment
+      const { rows: shipRows } = await tx(
+        `INSERT INTO shipments
+         (shipping_name, shipping_address, shipping_city, shipping_state, shipping_country,
+          shipping_phone, shipping_company, billing_name, billing_address, billing_city,
+          billing_state, billing_country, billing_phone, billing_company)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING shipment_id`,
+        [shippingName, shippingAddress, shippingCity, shippingState, shippingCountry,
+         shippingPhone, shippingCompany||null,
+         billingName||shippingName, billingAddress||shippingAddress, billingCity||shippingCity,
+         billingState||shippingState, billingCountry||shippingCountry,
+         billingPhone||shippingPhone, billingCompany||null]
+      );
+      const shipmentId = shipRows[0].shipment_id;
+
+      // Payment — NEVER store raw card data.  Only metadata.
+      const { rows: payRows } = await tx(
+        `INSERT INTO payments (user_id, payment_method, payment_name, amount, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, NOW(), NOW()) RETURNING payment_id`,
+        [userId, payment_method, payment_method === "cod" ? "Cash on Delivery" : "Card Payment", totalPrice]
+      );
+      const paymentId = payRows[0].payment_id;
+
+      const orderStatus = payment_method === "cod" ? "COD_PENDING" : "PENDING";
+
+      // Order
+      await tx(
+        `INSERT INTO orders
+         (order_id_str, email, amount, order_status, shipment_id, payment_id, user_id,
+          subtotal, shipping_cost, tax, total_price, discount, coupon_code,
+          tracking_number, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW(),NOW())`,
+        [orderIdStr, email.toLowerCase(), totalPrice, orderStatus, shipmentId, paymentId, userId,
+         subtotal, shipping, tax, totalPrice, discount, couponCode, trackNum]
+      );
+
+      // Get the auto-incremented order_id back
+      const { rows: oRows } = await tx("SELECT order_id FROM orders WHERE order_id_str = $1", [orderIdStr]);
+      const dbOrderId = oRows[0].order_id;
+
+      // Order items + stock deduction
+      for (const item of items) {
+        const p = productMap[item.id];
+        await tx(
+          `INSERT INTO order_items (order_id, product_id, product_name, quantity, price, condition, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,NOW(),NOW())`,
+          [dbOrderId, item.id, p.part_number, item.quantity, p.price, item.condition || null]
+        );
+        await tx(
+          "UPDATE products SET quantity = quantity - $1, updated_at = NOW() WHERE product_id = $2",
+          [item.quantity, item.id]
+        );
+      }
+
+      // Coupon uses counter
+      if (couponCode) {
+        await tx("UPDATE coupons SET uses_count = uses_count + 1 WHERE code = $1", [couponCode]);
+      }
+
+      // Activity log
+      await tx(
+        `INSERT INTO activity_logs (user_email, order_id, activity, details, created_at, updated_at)
+         VALUES ($1,$2,'Order Created',$3,NOW(),NOW())`,
+        [email.toLowerCase(), dbOrderId, JSON.stringify({ order_id: dbOrderId, total: totalPrice })]
+      );
     });
 
-    // ===== SECURE TOTALS RE-CALC (includes coupon) =====
-    const orderDetails = req.body.orderDetails || {};
-    const itemsForCalc = (orderDetails.items || []).map((i) => {
-      // use effective_price if provided (handles sale prices), else sale_price, else price
-      const effectivePrice = Number(i.effective_price) || Number(i.sale_price) || Number(i.price) || 0;
-      return {
-        price: Number(i.price) || 0,
-        effective_price: effectivePrice,
-        quantity: Number(i.quantity) || 1,
-      };
-    });
+    // Non-blocking confirmation email
+    sendEmail(null, email, "Order Confirmed – Killswitch", `<p>Your order ${orderIdStr} has been placed. Tracking: ${trackNum}</p>`)
+      .catch(console.error);
 
-    const computedSubtotal = itemsForCalc.reduce(
-      (sum, it) => sum + it.effective_price * it.quantity,
-      0
+    return res.status(201).json({
+      trackingNumber: trackNum,
+      orderId:        orderIdStr,
+      total:          totalPrice,
+      discount,
+      couponCode,
+    });
+  } catch (err) {
+    console.error("checkout:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+// ── Get All Orders (admin) ────────────────────────────────────────────────────
+
+const getAllOrders = async (_req, res) => {
+  try {
+    const { rows: orders } = await query(
+      `SELECT
+         o.order_id, o.order_id_str, o.email, o.order_status, o.total_price,
+         o.subtotal, o.shipping_cost, o.tax, o.discount, o.coupon_code,
+         o.tracking_number, o.leadtime, o.created_at,
+         u.name, u.phoneno,
+         s.shipping_name, s.shipping_address, s.shipping_city, s.shipping_state,
+         s.shipping_country, s.shipping_phone, s.shipping_company, s.shipping_method, s.shipping_date,
+         s.billing_name, s.billing_address, s.billing_city, s.billing_state,
+         s.billing_country, s.billing_phone, s.billing_company,
+         p.payment_method, p.payment_name
+       FROM orders o
+       LEFT JOIN users    u ON u.id           = o.user_id
+       LEFT JOIN shipments s ON s.shipment_id = o.shipment_id
+       LEFT JOIN payments  p ON p.payment_id  = o.payment_id
+       ORDER BY o.created_at DESC`
     );
 
-    const shippingCost = Number(orderDetails.shipping) || 0;
-    const taxRate = 0.2; // keep same as frontend
-
-    // coupon lookup and validation
-    let appliedCoupon = null;
-    let discount = 0;
-
-    if (orderDetails.couponCode) {
-      const code = orderDetails.couponCode.toString().trim().toUpperCase();
-      appliedCoupon = await Coupon.findOne({ where: { code, is_active: true } });
-      if (appliedCoupon) {
-        const now = new Date();
-        if (
-          (appliedCoupon.expires_at && new Date(appliedCoupon.expires_at) < now) ||
-          (appliedCoupon.min_purchase_amount && computedSubtotal < appliedCoupon.min_purchase_amount) ||
-          (appliedCoupon.max_uses && appliedCoupon.uses_count >= appliedCoupon.max_uses)
-        ) {
-          // coupon no longer valid
-          appliedCoupon = null;
-        }
-      }
-
-      if (appliedCoupon) {
-        if (appliedCoupon.discount_type === 'percentage') {
-          discount = +(computedSubtotal * (appliedCoupon.discount_value / 100)).toFixed(2);
-        } else {
-          discount = +appliedCoupon.discount_value;
-        }
-        discount = Math.min(discount, computedSubtotal);
-      }
+    // Attach items per order in one query (avoid N+1)
+    const orderIds = orders.map(o => o.order_id);
+    let items = [];
+    if (orderIds.length) {
+      const ph = orderIds.map((_, n) => `$${n + 1}`).join(",");
+      const { rows } = await query(
+        `SELECT oi.*, pr.part_number, pr.image, pr.condition AS product_condition
+         FROM order_items oi
+         LEFT JOIN products pr ON pr.product_id = oi.product_id
+         WHERE oi.order_id IN (${ph})`,
+        orderIds
+      );
+      items = rows;
     }
 
-    const taxableBase = Math.max(0, computedSubtotal - discount);
-    const tax = +(taxableBase * taxRate).toFixed(2);
-    const computedTotal = +(taxableBase + shippingCost + tax).toFixed(2);
+    const itemsByOrder = {};
+    items.forEach(i => { (itemsByOrder[i.order_id] = itemsByOrder[i.order_id] || []).push(i); });
 
-    // Process payment (use computedTotal, do not trust client)
-    // Handle different payment methods including COD
-    const paymentMethod = req.body.payment_method || "card";
-    
-    let paymentData = {
-      userId: user.id,
-      payment_method: paymentMethod,
-      payment_name: req.body.payment_name || (paymentMethod === "cod" ? "Cash on Delivery" : "Card Payment"),
-      amount: computedTotal,
-    };
-    
-    // Add card details for non-COD payments, null for COD
-    if (paymentMethod !== "cod") {
-      paymentData.card_number = req.body.cardNumber;
-      paymentData.cardCVC = req.body.cardCVC;
-      paymentData.cardExpire = req.body.cardExpiry;
-    } else {
-      // Set default values for COD payments (database doesn't allow null)
-      paymentData.card_number = "COD";
-      paymentData.cardCVC = "000";
-      paymentData.cardExpire = "00/00";
-    }
-    
-    // Prepare cart items (use request items but totals are from server calc)
-    const cartItems = (orderDetails.items || []).map((item) => {
-      // use effective_price (sale price) if available, else regular price
-      const chargedPrice = Number(item.effective_price) || Number(item.sale_price) || Number(item.price) || 0;
-      return {
-        product_id: item.id,
-        quantity: item.quantity,
-        price: chargedPrice,
-        condition: item.condition,
-      };
-    });
-    
-    // VALIDATE STOCK AVAILABILITY BEFORE CREATING ANY RECORDS
-    console.log('Validating stock for items:', cartItems);
-    for (const item of cartItems) {
-      const products = await product.findOne({
-        where: { product_id: item.product_id },
-      });
+    const result = orders.map(o => ({
+      ...o,
+      orderDetails: { items: itemsByOrder[o.order_id] || [] },
+    }));
 
-      if (!products) {
-        return res.status(400).json({ 
-          success: false, 
-          message: `Product with ID ${item.product_id} not found`,
-          error: `Product ${item.product_id} not found` 
-        });
-      }
-      
-      console.log(`Product ${item.product_id}: Available=${products.quantity}, Requested=${item.quantity}`);
-      
-      if (products.quantity < item.quantity) {
-        return res.status(400).json({ 
-          success: false, 
-          message: `Insufficient stock for product ${products.product_name || item.product_id}. Available: ${products.quantity}, Requested: ${item.quantity}`,
-          error: `Not enough stock for product: ${item.product_id}`,
-          productName: products.product_name,
-          availableStock: products.quantity,
-          requestedQuantity: item.quantity
-        });
-      }
-    }
-    console.log('Stock validation passed for all items');
-    
-    console.log('Creating payment with data:', paymentData);
-    const payment = await Payment.create(paymentData);
-    console.log(`Payment created successfully: ${payment.payment_id}, amount: ${payment.amount}`);
-
-    // Create order with appropriate status based on payment method
-    const orderStatus = paymentMethod === "cod" ? "COD_PENDING" : "PENDING";
-    
-    // Generate unique order ID
-    const orderId = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
-    
-    const order = await Order.create({
-      userId: user.id,
-      orderId: orderId,
-      email: user.email,
-      amount: computedTotal,
-      order_status: orderStatus,
-      shipment_id: shipment.shipment_id,
-      subtotal: computedSubtotal,
-      shipping_cost: shippingCost,
-      tax,
-      total_price: computedTotal,
-      discount,
-      couponCode: appliedCoupon ? appliedCoupon.code : null,
-      payment_id: payment.payment_id,
-      // Add shipping and billing information directly to order
-      shippingName: req.body.shippingName,
-      shippingMethod: req.body.shippingMethod,
-      shippingCompany: req.body.shippingCompany,
-      shippingPhone: req.body.shippingPhone,
-      shippingAddress: req.body.shippingAddress,
-      shippingCity: req.body.shippingCity,
-      shippingState: req.body.shippingState,
-      shippingCountry: req.body.shippingCountry,
-      billingName: req.body.billingName,
-      billingCompany: req.body.billingCompany,
-      billingPhone: req.body.billingPhone,
-      billingAddress: req.body.billingAddress,
-      billingCity: req.body.billingCity,
-      billingState: req.body.billingState,
-      billingCountry: req.body.billingCountry,
-    });
-
-    // if a coupon was applied, increment its usage counter
-    if (appliedCoupon) {
-      appliedCoupon.uses_count = (appliedCoupon.uses_count || 0) + 1;
-      try {
-        await appliedCoupon.save();
-      } catch (err) {
-        console.warn('Failed to increment coupon uses_count:', err);
-      }
-    }
-
-    console.log(`Order created: ${order.order_id}`);
-
-    // Save shipping and billing addresses to Address table (linked to userId)
-    try {
-      // Save shipping address
-      if (req.body.shippingName && req.body.shippingAddress) {
-        await Address.create({
-          userId: user.id,
-          type: 'shipping',
-          name: req.body.shippingName,
-          company: req.body.shippingCompany || '',
-          phone: req.body.shippingPhone,
-          address: req.body.shippingAddress,
-          city: req.body.shippingCity,
-          state: req.body.shippingState,
-          country: req.body.shippingCountry,
-          email: user.email,
-          isDefault: false,
-        });
-        console.log(`Shipping address saved for user ${user.id}`);
-      }
-
-      // Save billing address if different from shipping
-      if (req.body.billingName && req.body.billingAddress) {
-        await Address.create({
-          userId: user.id,
-          type: 'billing',
-          name: req.body.billingName,
-          company: req.body.billingCompany || '',
-          phone: req.body.billingPhone,
-          address: req.body.billingAddress,
-          city: req.body.billingCity,
-          state: req.body.billingState,
-          country: req.body.billingCountry,
-          email: user.email,
-          isDefault: false,
-        });
-        console.log(`Billing address saved for user ${user.id}`);
-      }
-    } catch (addressError) {
-      console.error('Error saving addresses:', addressError);
-      // Don't fail the order if address save fails
-    }
-
-    // Create order items and update product stock (stock already validated)
-    for (const item of cartItems) {
-      // Get product again to reduce stock (we already validated availability)
-      const products = await product.findOne({
-        where: { product_id: item.product_id },
-      });
-
-      // Reduce stock (no need to check again, already validated)
-      products.quantity -= item.quantity;
-      await products.save();
-      console.log(`Reduced stock for product ${item.product_id}: ${products.quantity + item.quantity} -> ${products.quantity}`);
-
-      // Create order item
-      await OrderItem.create({
-        orderId: order.order_id,
-        productId: item.product_id,
-        productName: products.product_name || products.product_part_number || `Product ${item.product_id}`,
-        quantity: item.quantity,
-        price: item.price,
-        condition: item.condition,
-      });
-      console.log(`Order Item created for product ${item.product_id}`);
-    }
-
-    // Log activity (include coupon + discount details)
-    await ActivityLog.create({
-      user_email: user.email,
-      order_id: order.order_id,
-      activity: "Order created",
-      details: {
-        order_id: order.order_id,
-        email: user.email,
-        phoneNumber: user.phoneno,
-        firstName: user.first_name,
-        amount: order.total_price,
-        shippingName: shipment.shippingName,
-        shippingPhone: shipment.shippingPhone,
-        shippingAddress: shipment.shippingAddress,
-        shippingCity: shipment.shippingCity,
-        shippingState: shipment.shippingState,
-        shippingCountry: shipment.shippingCountry,
-        billingName: shipment.billingName,
-        billingCompany: shipment.billingCompany,
-        billingPhone: shipment.billingPhone,
-        billingAddress: shipment.billingAddress,
-        billingCity: shipment.billingCity,
-        billingState: shipment.billingState,
-        billingCountry: shipment.billingCountry,
-        orderDetails: {
-          items: cartItems,
-          subtotal: order.subtotal,
-          shipping: order.shipping_cost,
-          discount,
-          couponCode: appliedCoupon ? appliedCoupon.code : "",
-          tax: order.tax,
-          total: order.total_price,
-        },
-      },
-    });
-
-    // Generate a more realistic tracking number
-    const generateTrackingNumber = () => {
-      const timestamp = Date.now().toString().slice(-8); // Last 8 digits of timestamp
-      const random = Math.floor(Math.random() * 1000)
-        .toString()
-        .padStart(3, "0");
-      return `TRK${timestamp}${random}`;
-    };
-
-    const trackingNumber = generateTrackingNumber();
-
-    // Update the order with the tracking number
-    await order.update({ trackingNumber: trackingNumber });
-
-    // Calculate user's order number (sequential for this user)
-    const userOrderCount = await Order.count({ where: { userId: user.id } });
-    const userOrderNumber = userOrderCount;
-
-    // Send confirmation email to user
-    try {
-      const orderItems = await OrderItem.findAll({
-        where: { orderId: order.order_id },
-        include: [{ model: product, as: 'product' }]
-      });
-      const items = orderItems.map(item => ({
-        name: item.product?.name || item.productName || 'Product',
-        quantity: item.quantity,
-        price: item.price
-      }));
-      const { subject, html } = orderConfirmationTemplate({
-        order: {
-          orderId: userOrderNumber, // Use user-specific order number
-          subtotal: order.subtotal,
-          shipping_cost: order.shipping_cost,
-          tax: order.tax,
-          total_price: order.total_price,
-          shippingName: shipment.shippingName,
-          shippingAddress: shipment.shippingAddress,
-          shippingCity: shipment.shippingCity,
-          shippingState: shipment.shippingState,
-          shippingCountry: shipment.shippingCountry,
-          shippingPhone: shipment.shippingPhone,
-          shippingMethod: order.shippingMethod,
-          trackingNumber: trackingNumber
-        },
-        items
-      });
-      await sendEmail(null, user.email, subject, html);
-
-      // Send notification to admin
-      const adminEmail = process.env.ADMIN_EMAIL || 'contact@killswitch.us';
-      await sendEmail(null, adminEmail, `New Order Received #${order.order_id}`, `<p>A new order has been placed by ${user.email}.</p><p>User Order #: ${userOrderNumber}</p><p>System Order ID: ${order.order_id}</p><p>Total: $${order.total_price}</p><p>Tracking: ${trackingNumber}</p>`);
-    } catch (emailError) {
-      console.error('Error sending order confirmation email:', emailError);
-    }
-
-    // Respond with order details (reflect secure totals + coupon)
-    return res.status(201).json({
-
-      trackingNumber: trackingNumber,
-      email: user.email,
-      phoneNumber: user.phoneno,
-      Name: user.first_name,
-      amount: order.total_price,
-      cardExpiry: payment.cardExpire,
-      AmountPaidBy: payment.payment_name,
-      shippingDetails: shipment,
-      billingDetails: shipment,
-      paymentMethod: payment.payment_method,
-      orderDetails: {
-        items: cartItems,
-        subtotal: order.subtotal,
-        shipping: order.shipping_cost,
-        discount,
-        couponCode: appliedCoupon ? appliedCoupon.code : "",
-        tax: order.tax,
-        total: order.total_price,
-      },
-    });
-  } catch (error) {
-    console.error('Checkout error:', error);
-    
-    // Return JSON error response instead of HTML
-    return res.status(500).json({
-      success: false,
-      message: error.message || 'Failed to process checkout',
-      error: process.env.NODE_ENV === 'development' ? error.stack : 'Internal server error'
-    });
-  }
-};
-
-const getAllOrders = async (req, res, next) => {
-  try {
-    const orders = await Order.findAll({
-      include: [
-        {
-          model: Shipment,
-          as: "shipment",
-          required: false, // LEFT JOIN instead of INNER JOIN
-        },
-        {
-          model: User,
-          as: "user",
-          required: false,
-        },
-        {
-          model: Payment,
-          as: "payment",
-          required: false,
-        },
-        {
-          model: OrderItem,
-          as: "orderItem",
-          required: false,
-          include: [
-            {
-              model: product,
-              as: "product",
-              required: false,
-              include: [
-                {
-                  model: ProductImage,
-                  as: "images",
-                  attributes: ["id", "url"],
-                  required: false
-                },
-                {
-                  model: brandcategory,
-                  as: "brandcategory",
-                  required: false,
-                  include: [
-                    {
-                      model: brand,
-                      as: "brand",
-                      attributes: ["brand_id", "brand_name"],
-                      required: false
-                    },
-                    {
-                      model: category,
-                      as: "category",
-                      attributes: ["product_category_id", "category_name"],
-                      required: false
-                    },
-                    {
-                      model: subcategory,
-                      as: "subcategory",
-                      attributes: ["sub_category_id", "sub_category_name"],
-                      required: false
-                    }
-                  ]
-                }
-              ]
-            }
-          ]
-        },
-      ],
-    });
-
-    const formattedOrders = orders.map((order) => {
-      const shipment = order.shipment;
-      const user = order.user;
-      const payment = order.payment;
-      const items = order.orderItem;
-      console.log("Order data:", { shipment, payment, user });
-
-      return {
-        orderId: order.order_id,
-        order_id: order.order_id, // Add both formats for compatibility
-        order_status: order.order_status,
-        created_at: order.createdAt,
-        email: user?.email ?? null,
-        phoneNumber: user?.phoneno ?? null,
-        Name: user?.name ?? null,
-        amount: order.total_price,
-        total_price: order.total_price, // Add both formats
-        cardExpiry: payment?.cardExpire ?? null,
-        AmountPaidBy: payment?.payment_name ?? null,
-        paymentMethod: payment?.payment_method ?? "Card Payment",
-
-        // Use order fields directly if shipment is null
-        shippingName: shipment?.shippingName ?? order.shippingName ?? null,
-        shippingCompany:
-          shipment?.shippingCompany ?? order.shippingCompany ?? null,
-        shippingPhone: shipment?.shippingPhone ?? order.shippingPhone ?? null,
-        shippingAddress:
-          shipment?.shippingAddress ?? order.shippingAddress ?? null,
-        shippingCity: shipment?.shippingCity ?? order.shippingCity ?? null,
-        shippingState: shipment?.shippingState ?? order.shippingState ?? null,
-        shippingCountry:
-          shipment?.shippingCountry ?? order.shippingCountry ?? null,
-        shippingMethod:
-          shipment?.shippingMethod ?? order.shippingMethod ?? null,
-        shippingDate: shipment?.shippingDate ?? null,
-
-        // Billing Details
-        billingName: shipment?.billingName ?? order.billingName ?? null,
-        billingCompany:
-          shipment?.billingCompany ?? order.billingCompany ?? null,
-        billingPhone: shipment?.billingPhone ?? order.billingPhone ?? null,
-        billingAddress:
-          shipment?.billingAddress ?? order.billingAddress ?? null,
-        billingCity: shipment?.billingCity ?? order.billingCity ?? null,
-        billingState: shipment?.billingState ?? order.billingState ?? null,
-        billingCountry:
-          shipment?.billingCountry ?? order.billingCountry ?? null,
-
-        // Lead time
-        leadtime: order.leadtime,
-        leadTime: order.leadtime, // Add both formats
-
-        // include tracking number for frontend display
-        trackingNumber: order.trackingNumber || order.order_id,
-
-        // Order Details
-        orderDetails: {
-          items: items ? items.map(item => {
-            const productData = item.product;
-            return {
-              // Order item details
-              order_item_id: item.order_item_id,
-              quantity: item.quantity,
-              condition: item.condition,
-              price: item.price,
-              unit_price: item.price,
-              
-              // Product details
-              id: productData?.product_id,
-              product_id: productData?.product_id,
-              product_name: item.productName || productData?.part_number,
-              name: item.productName || productData?.part_number,
-              item: item.productName || productData?.part_number,
-              
-              // Part number with multiple field names for compatibility
-              part_number: productData?.part_number,
-              product_part_number: productData?.part_number,
-              partNumber: productData?.part_number,
-              productPartNumber: productData?.part_number,
-              sku: productData?.part_number,
-              product_code: productData?.part_number,
-              productCode: productData?.part_number,
-              
-              // Product images - Cloudinary URLs
-              product_image_url: productData?.image, // Main image from product table
-              image_url: productData?.image,
-              image: productData?.image,
-              product_image: productData?.image,
-              productImage: productData?.image,
-              
-              // Additional images from ProductImage table
-              product_images: productData?.images || [],
-              images: productData?.images || [],
-              additional_images: productData?.images?.map(img => img.url) || [],
-              
-              // Brand information
-              brand: productData?.brandcategory?.brand?.brand_name,
-              brand_name: productData?.brandcategory?.brand?.brand_name,
-              brandName: productData?.brandcategory?.brand?.brand_name,
-              product_brand: productData?.brandcategory?.brand?.brand_name,
-              manufacturer: productData?.brandcategory?.brand?.brand_name,
-              
-              // Category information
-              category: productData?.brandcategory?.category?.category_name,
-              category_name: productData?.brandcategory?.category?.category_name,
-              categoryName: productData?.brandcategory?.category?.category_name,
-              product_category: productData?.brandcategory?.category?.category_name,
-              type: productData?.brandcategory?.category?.category_name,
-              
-              // Product specifications
-              specifications: productData?.long_description,
-              specs: productData?.long_description,
-              product_specifications: productData?.long_description,
-              technical_specs: productData?.long_description,
-              features: productData?.long_description,
-              
-              // Product description
-              description: productData?.short_description,
-              product_description: productData?.short_description,
-              details: productData?.short_description,
-              summary: productData?.short_description,
-              
-              // Product condition
-              product_condition: productData?.condition,
-              product_sub_condition: productData?.sub_condition,
-              
-              // Product status
-              status: productData?.status,
-              product_status: productData?.status,
-            };
-          }) : [],
-          subtotal: order.subtotal,
-          shipping: order.shipping_cost,
-          tax: order.tax,
-          total: order.total_price,
-        },
-        // Coupon and discount info at root level for easy access
-        couponCode: order.couponCode,
-        discount: order.discount,
-      };
-    });
-
-    return res.status(200).json(formattedOrders);
-  } catch (error) {
-    console.error("Error in getAllOrders:", error);
-    next(error);
-  }
-};
-
-// Track a single order's progress by email + numeric orderId (from your DB)
-const trackProgress = async (req, res) => {
-  try {
-    const emailRaw = (req.query.email || "").trim();
-    const orderIdRaw = (req.query.orderId || "").toString().trim();
-
-    if (!emailRaw || !orderIdRaw) {
-      return res
-        .status(400)
-        .json({ message: "Email and orderId are required" });
-    }
-
-    // order_id in your DB is numeric; reject non-numeric values early
-    if (!/^\d+$/.test(orderIdRaw)) {
-      return res.status(400).json({ message: "orderId must be a numeric ID" });
-    }
-    const orderId = parseInt(orderIdRaw, 10);
-
-    // Normalize email and match case-insensitively (Postgres)
-    const email = emailRaw.toLowerCase();
-
-    const order = await Order.findOne({
-      where: { order_id: orderId },
-      include: [
-        {
-          model: User,
-          as: "user",
-          required: true,
-          where: { email: { [Op.iLike]: email } },
-          attributes: ["name", "email", "phoneno"],
-        },
-        {
-          model: OrderItem,
-          as: "orderItem",
-          required: false,
-          include: [
-            {
-              model: product,
-              as: "product",
-              required: false,
-              attributes: ["part_number", "condition"],
-            },
-          ],
-        },
-        {
-          model: Shipment,
-          as: "shipment",
-          required: false,
-          attributes: [
-            "shippingMethod",
-            "shippingDate",
-            "shippingPhone",
-            "shippingAddress",
-            "shippingCity",
-            "shippingState",
-            "shippingCountry",
-          ],
-        },
-        {
-          model: Payment,
-          as: "payment",
-          required: false,
-          attributes: ["payment_method"],
-        },
-      ],
-    });
-
-    if (!order) {
-      return res.status(404).json({ message: "Order not found" });
-    }
-
-    return res.json({
-      items: (order.orderItem || []).map((item) => ({
-        item: item.product?.part_number || `Product ${item.product_id}`,
-        condition: item.product?.condition || item.condition || "N/A",
-        quantity: item.quantity,
-      })),
-      shippingMethod: order.shipment?.shippingMethod || "N/A",
-      shippingDate: order.shipment?.shippingDate || "N/A",
-      shippingPhone: order.shipment?.shippingPhone || "N/A",
-      shippingAddress: order.shipment?.shippingAddress || "N/A",
-      shippingCity: order.shipment?.shippingCity || "N/A",
-      shippingState: order.shipment?.shippingState || "N/A",
-      shippingCountry: order.shipment?.shippingCountry || "N/A",
-      paymentMethod: order.payment?.payment_method || "Card Payment",
-      orderDate: order.createdAt,
-      orderId: order.order_id,
-      orderStatus: order.order_status,
-      leadTime: order.leadtime || "N/A",
-      orderPlacedBy: order.user?.name || "N/A",
-      amountPaid: order.total_price,
-    });
-  } catch (error) {
-    console.error("Track Progress Error:", error);
-    return res.status(500).json({ message: error.message || "Server error" });
-  }
-};
-
-const updateOrderStatus = async (req, res) => {
-  const { order_id, order_status, leadTime, shippingMethod, shippingDate } =
-    req.body;
-
-  try {
-    // Find order including shipment
-    const order = await Order.findOne({
-      where: { order_id },
-      include: [
-        {
-          model: Shipment,
-          as: "shipment",
-        },
-      ],
-    });
-
-    if (!order) {
-      return res.status(404).json({ error: "Order not found" });
-    }
-
-    const changes = {};
-
-    // Update order status
-    if (order_status && order.order_status !== order_status) {
-      changes.order_status = order_status;
-      order.order_status = order_status;
-    }
-
-    // Update leadTime
-    if (leadTime) {
-      const newLeadTime = new Date(leadTime);
-      if (isNaN(newLeadTime.getTime())) {
-        return res
-          .status(400)
-          .json({ error: "Invalid leadTime format. Expected YYYY-MM-DD." });
-      }
-      changes.leadTime = newLeadTime;
-      order.leadtime = newLeadTime;
-    }
-
-    // Handle shipment updates - create shipment if it doesn't exist
-    if (shippingMethod || shippingDate) {
-      if (order.shipment) {
-        // Update existing shipment
-        if (
-          shippingMethod &&
-          order.shipment.shippingMethod !== shippingMethod
-        ) {
-          changes.shippingMethod = shippingMethod;
-          order.shipment.shippingMethod = shippingMethod;
-        }
-
-        if (shippingDate && order.shipment.shippingDate !== shippingDate) { 
-          changes.shippingDate = shippingDate;
-          order.shipment.shippingDate = shippingDate;
-        }
-
-        // Save shipment changes
-        await order.shipment.save();
-      } else {
-        // Create new shipment if it doesn't exist
-        console.log("Creating new shipment for order:", order_id);
-        const newShipment = await Shipment.create({
-          shippingMethod: shippingMethod || null,
-          shippingDate: shippingDate || null,
-        });
-
-        // Update order with new shipment_id
-        order.shipment_id = newShipment.shipment_id;
-        changes.shipment_created = true;
-        changes.shippingMethod = shippingMethod;
-        changes.shippingDate = shippingDate;
-      }
-    }
-
-    // Save order changes
-    await order.save();
-
-    // Send email if status changed to notification-worthy statuses
-    if (changes.order_status && ['PROCESSING', 'CANCELLED', 'SHIPPED', 'DELIVERED'].includes(order_status)) {
-      try {
-        const orderItems = await OrderItem.findAll({
-          where: { orderId: order.order_id },
-          include: [{ model: product, as: 'product' }]
-        });
-        const items = orderItems.map(item => ({
-          name: item.product?.name || item.productName || 'Product',
-          quantity: item.quantity,
-          price: item.price
-        }));
-        const user = await User.findByPk(order.userId);
-        if (user) {
-          // Calculate user's order number (sequential for this user)
-          const userOrderCount = await Order.count({
-            where: {
-              userId: user.id,
-              createdAt: { [Op.lte]: order.createdAt }
-            }
-          });
-          const { subject, html } = orderStatusUpdateTemplate({
-            order: {
-              orderId: userOrderCount, // Use user-specific order number
-              shippingName: order.shipment?.shippingName,
-              id: userOrderCount
-            },
-            items,
-            newStatus: order_status
-          });
-          await sendEmail(null, user.email, subject, html);
-        }
-      } catch (emailError) {
-        console.error('Error sending status update email:', emailError);
-      }
-    }
-
-    // Return the updated order data for frontend state update
-    const updatedOrder = await Order.findOne({
-      where: { order_id: order.order_id },
-      include: [
-        {
-          model: Shipment,
-          as: "shipment",
-        },
-        {
-          model: User,
-          as: "user",
-          attributes: ["name", "email", "phoneno"],
-        },
-        {
-          model: OrderItem,
-          as: "orderItem",
-          include: [
-            {
-              model: product,
-              as: "product",
-              attributes: ["part_number", "condition", "price"],
-            },
-          ],
-        },
-        {
-          model: Payment,
-          as: "payment",
-          attributes: ["payment_method", "payment_name", "amount"],
-        },
-      ],
-    });
-
-    res.json({ 
-      message: "Order updated successfully", 
-      changes,
-      order: updatedOrder
-    });
+    return res.json(result);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Server error", details: err.message });
+    console.error("getAllOrders:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
   }
 };
 
-// User cancel order function
-const userCancelOrder = async (req, res) => {
-  const { orderId } = req.params;
-  const cleanOrderId = orderId.trim();
-  const userEmail = req.user?.email; // Assuming auth middleware sets req.user
+// ── Track Orders by Email ─────────────────────────────────────────────────────
 
-  if (!userEmail) {
-    return res.status(401).json({ error: "User not authenticated" });
-  }
-
-  try {
-    // Find order by orderId (string) and user email
-    let whereCondition = { email: { [Op.iLike]: userEmail } };
-    
-    if (/^\d+$/.test(cleanOrderId)) {
-      // If orderId is numeric, treat as order_id
-      whereCondition.order_id = parseInt(cleanOrderId, 10);
-    } else {
-      // Otherwise, treat as string orderId
-      whereCondition.orderId = cleanOrderId;
-    }
-    
-    const order = await Order.findOne({
-      where: whereCondition,
-      include: [
-        {
-          model: Shipment,
-          as: "shipment",
-        },
-      ],
-    });
-
-    if (!order) {
-      return res.status(404).json({ error: "Order not found or does not belong to user" });
-    }
-
-    // Check if order can be cancelled
-    const cancellableStatuses = ['COD_PENDING', 'PROCESSING', 'PENDING'];
-    if (!cancellableStatuses.includes(order.order_status)) {
-      return res.status(400).json({ error: `Order cannot be cancelled at this stage. Current status: ${order.order_status}` });
-    }
-
-    // Update status to CANCELLED
-    order.order_status = 'CANCELLED';
-    await order.save();
-
-    // Send email notification
-    try {
-      const orderItems = await OrderItem.findAll({
-        where: { orderId: order.order_id },
-        include: [{ model: product, as: 'product' }]
-      });
-      const items = orderItems.map(item => ({
-        name: item.product?.name || item.productName || 'Product',
-        quantity: item.quantity,
-        price: item.price
-      }));
-      const user = await User.findOne({ where: { email: userEmail } });
-      if (user) {
-        // Calculate user's order number
-        const userOrderCount = await Order.count({
-          where: {
-            userId: user.id,
-            createdAt: { [Op.lte]: order.createdAt }
-          }
-        });
-        const { subject, html } = orderStatusUpdateTemplate({
-          order: {
-            orderId: userOrderCount,
-            shippingName: order.shipment?.shippingName,
-            id: userOrderCount
-          },
-          items,
-          newStatus: 'CANCELLED'
-        });
-        await sendEmail(null, user.email, subject, html);
-      }
-    } catch (emailError) {
-      console.error('Error sending cancellation email:', emailError);
-    }
-
-    res.json({ message: "Order cancelled successfully" });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Server error", details: err.message });
-  }
-};
-
-// Track orders by email
 const trackOrders = async (req, res) => {
   const { email } = req.query;
-  if (!email) {
-    return res.status(400).json({ message: "Invalid email" });
-  }
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+    return res.status(400).json({ message: "Valid email required" });
+
   try {
-    const orders = await Order.findAll({
-      include: [
-        {
-          model: User,
-          as: "user",
-          where: { email },
-          attributes: ["name"],
-        },
-        {
-          model: OrderItem,
-          as: "orderItem",
-          include: [
-            {
-              model: product,
-              as: "product",
-              attributes: ["product_id", "part_number", "condition", "image", "short_description", "long_description"],
-              include: [
-                {
-                  model: ProductImage,
-                  as: "images",
-                  attributes: ["id", "url"],
-                  required: false
-                },
-                {
-                  model: brandcategory,
-                  as: "brandcategory",
-                  required: false,
-                  include: [
-                    {
-                      model: brand,
-                      as: "brand",
-                      attributes: ["brand_id", "brand_name"],
-                      required: false
-                    },
-                    {
-                      model: category,
-                      as: "category",
-                      attributes: ["product_category_id", "category_name"],
-                      required: false
-                    }
-                  ]
-                }
-              ]
-            },
-          ],
-        },
-        {
-          model: Shipment,
-          as: "shipment",
-        },
-        {
-          model: Payment,
-          as: "payment",
-        },
-      ],
-      order: [["createdAt", "DESC"]],
-    });
+    const { rows: orders } = await query(
+      `SELECT o.*, s.shipping_method, s.shipping_phone, s.shipping_address,
+              s.shipping_date, p.payment_method, u.name AS placed_by
+       FROM orders o
+       JOIN users u ON u.id = o.user_id AND u.email = $1
+       LEFT JOIN shipments s ON s.shipment_id = o.shipment_id
+       LEFT JOIN payments  p ON p.payment_id  = o.payment_id
+       ORDER BY o.created_at DESC`,
+      [email.toLowerCase()]
+    );
 
-    if (!orders || orders.length === 0) {
-      return res.status(404).json({ error: "No orders found for this email" });
-    }
+    if (!orders.length) return res.status(404).json({ error: "No orders found" });
 
-    const formatted = orders.map((order) => ({
-      orderId: order.order_id,
-      orderStatus: order.order_status,
-      orderDate: order.createdAt,
-      leadTime: order.leadtime,
-      orderPlacedBy: order.user.name,
-      // include tracking number for frontend display
-      trackingNumber: order.trackingNumber || order.order_id,
-      amountPaid: order.total_price,
-      shippingMethod: order.shipment?.shippingMethod || "N/A",
-      shippingPhone: order.shipment?.shippingPhone || "N/A",
-      shippingAddress: order.shipment?.shippingAddress || "N/A",
-      shippingDate: order.shipment?.shippingDate || "N/A",
-      paymentMethod: order.payment?.payment_method || "Card Payment",
-      items: order.orderItem.map((item) => {
-        const productData = item.product;
-        return {
-          // Product name with multiple field names for compatibility
-          product_name: productData?.part_number || `Product ${item.productId}`,
-          productName: productData?.part_number || `Product ${item.productId}`,
-          item: productData?.part_number || `Product ${item.productId}`,
-          name: productData?.part_number || `Product ${item.productId}`,
-          
-          // Part number information
-          part_number: productData?.part_number,
-          product_part_number: productData?.part_number,
-          partNumber: productData?.part_number,
-          sku: productData?.part_number,
-          product_code: productData?.part_number,
-          productCode: productData?.part_number,
-          
-          // Product condition
-          condition: productData?.condition || item.condition || "New",
-          product_condition: productData?.condition || item.condition || "New",
-          
-          // Quantity
-          quantity: item.quantity || 1,
-          
-          // Price information
-          price: item.price || 0,
-          product_price: item.price || 0,
-          unit_price: item.price || 0,
-          
-          // Product ID
-          id: item.productId,
-          product_id: item.productId,
-          
-          // Product images - Cloudinary URLs
-          product_image_url: productData?.image, // Main image from product table
-          image_url: productData?.image,
-          image: productData?.image,
-          product_image: productData?.image,
-          productImage: productData?.image,
-          
-          // Additional images from ProductImage table
-          product_images: productData?.images || [],
-          images: productData?.images || [],
-          additional_images: productData?.images?.map(img => img.url) || [],
-          
-          // Brand information
-          brand: productData?.brandcategory?.brand?.brand_name,
-          brand_name: productData?.brandcategory?.brand?.brand_name,
-          brandName: productData?.brandcategory?.brand?.brand_name,
-          product_brand: productData?.brandcategory?.brand?.brand_name,
-          manufacturer: productData?.brandcategory?.brand?.brand_name,
-          
-          // Category information
-          category: productData?.brandcategory?.category?.category_name,
-          category_name: productData?.brandcategory?.category?.category_name,
-          categoryName: productData?.brandcategory?.category?.category_name,
-          product_category: productData?.brandcategory?.category?.category_name,
-          type: productData?.brandcategory?.category?.category_name,
-          
-          // Product descriptions
-          description: productData?.short_description,
-          product_description: productData?.short_description,
-          details: productData?.short_description,
-          summary: productData?.short_description,
-          
-          // Product specifications
-          specifications: productData?.long_description,
-          specs: productData?.long_description,
-          product_specifications: productData?.long_description,
-          technical_specs: productData?.long_description,
-          features: productData?.long_description,
-        };
-      }),
-      // Pricing and payment information
-      subtotal: order.subtotal,
-      shipping: order.shipping_cost,
-      tax: order.tax,
-      couponCode: order.couponCode,
-      discount: order.discount,
-      total: order.total_price,
-    }));
+    const orderIds = orders.map(o => o.order_id);
+    const ph       = orderIds.map((_, n) => `$${n + 1}`).join(",");
+    const { rows: items } = await query(
+      `SELECT oi.*, pr.part_number, pr.image FROM order_items oi
+       LEFT JOIN products pr ON pr.product_id = oi.product_id
+       WHERE oi.order_id IN (${ph})`,
+      orderIds
+    );
 
-    res.json(formatted);
+    const itemsByOrder = {};
+    items.forEach(i => { (itemsByOrder[i.order_id] = itemsByOrder[i.order_id] || []).push(i); });
+
+    return res.json(
+      orders.map(o => ({ ...o, items: itemsByOrder[o.order_id] || [] }))
+    );
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Server error", details: err.message });
+    console.error("trackOrders:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
   }
 };
 
-// Deletion disabled: admins are not allowed to remove orders from the database.
-// They should instead update the order_status to "CANCELLED" via the update endpoint.
-const deleteOrder = async (req, res) => {
-  const { orderId } = req.params;
-  console.warn(`Attempted deletion of order ${orderId} - operation blocked.`);
-  return res.status(403).json({
-    success: false,
-    message: "Order deletion is prohibited. Update status to CANCELLED instead."
-  });
-};
+// ── Track by Tracking Number ──────────────────────────────────────────────────
 
-// Enhanced tracking endpoint with better error handling and logging
-// Track order by tracking number ONLY (no email/orderId)
 const trackOrderByTracking = async (req, res) => {
+  const raw = (req.query.trackingNumber || req.body?.trackingNumber || "").trim();
+  if (!raw) return res.status(400).json({ message: "trackingNumber required" });
+
   try {
-    const raw = (req.query.trackingNumber || req.body.trackingNumber || "")
-      .toString()
-      .trim();
-    if (!raw) {
-      return res
-        .status(400)
-        .json({ success: false, message: "trackingNumber is required" });
-    }
+    const { rows } = await query(
+      `SELECT o.*, s.shipping_name, s.shipping_address, s.shipping_city,
+              s.shipping_state, s.shipping_country, s.shipping_phone, s.shipping_method,
+              s.shipping_date, p.payment_method
+       FROM orders o
+       LEFT JOIN shipments s ON s.shipment_id = o.shipment_id
+       LEFT JOIN payments  p ON p.payment_id  = o.payment_id
+       WHERE o.tracking_number ILIKE $1`,
+      [raw.toUpperCase()]
+    );
+    if (!rows.length) return res.status(404).json({ message: "Order not found" });
+    const order = rows[0];
 
-    const clean = raw.toUpperCase();
-    const numeric = clean.replace(/\D/g, "");
+    const { rows: items } = await query(
+      `SELECT oi.*, pr.part_number, pr.condition AS product_condition
+       FROM order_items oi
+       LEFT JOIN products pr ON pr.product_id = oi.product_id
+       WHERE oi.order_id = $1`,
+      [order.order_id]
+    );
 
-    const order = await Order.findOne({
-      where: {
-        [Op.or]: [
-          { trackingNumber: clean },
-          ...(numeric
-            ? [{ trackingNumber: { [Op.iLike]: `%${numeric}%` } }]
-            : []),
-          { orderId: clean }, // fallback if you ever store TRK... in orderId
-        ],
-      },
-      include: [
-        {
-          model: User,
-          as: "user",
-          required: false,
-          attributes: ["name", "email", "phoneno"],
-        },
-        {
-          model: OrderItem,
-          as: "orderItem",
-          required: false,
-          include: [
-            {
-              model: product,
-              as: "product",
-              required: false,
-              attributes: ["part_number", "condition", "price"],
-            },
-          ],
-        },
-        { model: Shipment, as: "shipment", required: false },
-        {
-          model: Payment,
-          as: "payment",
-          required: false,
-          attributes: ["payment_method", "payment_name", "amount"],
-        },
-      ],
-    });
-
-    if (!order) {
-      return res.status(404).json({
-        success: false,
-        message: "Order not found for the provided tracking number.",
-      });
-    }
-
-    const items = (order.orderItem || []).map((it) => ({
-      id: it.product_id,
-      name: it.product?.part_number || `Product ${it.product_id}`,
-      item: it.product?.part_number || `Product ${it.product_id}`,
-      condition: it.product?.condition || it.condition || "New",
-      quantity: it.quantity || 1,
-      price: it.price ?? it.product?.price ?? 0,
-    }));
-
-    return res.json({
-      success: true,
-      order: {
-        orderId: order.order_id,
-        orderDate: order.createdAt,
-        orderStatus: order.order_status,
-        trackingNumber: order.trackingNumber || order.orderId,
-        email: order.email || order.user?.email || null,
-        shippingName:
-          order.shippingName || order.shipment?.shippingName || "N/A",
-        shippingAddress:
-          order.shippingAddress || order.shipment?.shippingAddress || "N/A",
-        shippingCity:
-          order.shippingCity || order.shipment?.shippingCity || "N/A",
-        shippingState:
-          order.shippingState || order.shipment?.shippingState || "N/A",
-        shippingCountry:
-          order.shippingCountry || order.shipment?.shippingCountry || "N/A",
-        shippingPhone:
-          order.shippingPhone || order.shipment?.shippingPhone || "N/A",
-        shippingMethod:
-          order.shippingMethod || order.shipment?.shippingMethod || "N/A",
-        shippingDate:
-          order.shippingDate || order.shipment?.shippingDate || "N/A",
-        paymentStatus: order.paymentStatus || "completed",
-        paymentMethod: order.payment?.payment_method || "Card",
-        AmountPaidBy: order.payment?.payment_name || "Card Holder",
-        subtotal: order.subtotal || 0,
-        shipping_cost: order.shipping_cost || 0,
-        tax: order.tax || 0,
-        total_price: order.total_price ?? order.amount ?? 0,
-        amountPaid: order.total_price ?? order.amount ?? 0,
-        leadtime: order.leadtime || "N/A",
-        items,
-        orderDetails: {
-          items,
-          subtotal: order.subtotal || 0,
-          shipping: order.shipping_cost || 0,
-          tax: order.tax || 0,
-          total: order.total_price ?? order.amount ?? 0,
-        },
-      },
-    });
-  } catch (error) {
-    return res.status(500).json({
-      success: false,
-      message: error.message || "Server error occurred",
-    });
+    return res.json({ success: true, order: { ...order, items } });
+  } catch (err) {
+    console.error("trackOrderByTracking:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
   }
 };
 
-// Generate and stream a simple PDF invoice for an order
-const getInvoice = async (req, res) => {
+// ── Update Order Status (admin) ───────────────────────────────────────────────
+
+const updateOrderStatus = async (req, res) => {
+  const { order_id, order_status, leadTime, shippingMethod, shippingDate } = req.body;
+  if (!order_id) return res.status(400).json({ error: "order_id required" });
+
   try {
-    const rawId = (req.params.orderId || '').toString().trim();
-    if (!rawId) return res.status(400).send('Missing order identifier');
+    const sets  = ["updated_at = NOW()"];
+    const vals  = [];
+    let   i     = 1;
 
-    // Determine whether rawId is numeric (order_id) or the orderId string
-    const where = /^\d+$/.test(rawId) ? { order_id: parseInt(rawId, 10) } : { orderId: rawId };
+    if (order_status) { sets.push(`order_status = $${i++}`); vals.push(order_status); }
+    if (leadTime)     {
+      const d = new Date(leadTime);
+      if (isNaN(d.getTime())) return res.status(400).json({ error: "Invalid leadTime" });
+      sets.push(`leadtime = $${i++}`); vals.push(d);
+    }
 
-    const order = await Order.findOne({
-      where,
-      include: [
-        { model: User, as: 'user', required: false },
-        { model: OrderItem, as: 'orderItem', required: false, include: [{ model: product, as: 'product', required: false }] },
-        { model: Shipment, as: 'shipment', required: false },
-        { model: Payment, as: 'payment', required: false }
-      ]
-    });
+    vals.push(order_id);
+    await query(`UPDATE orders SET ${sets.join(",")} WHERE order_id = $${i}`, vals);
 
-    if (!order) return res.status(404).send('Order not found');
+    if (shippingMethod || shippingDate) {
+      await query(
+        `UPDATE shipments SET
+          shipping_method = COALESCE($1, shipping_method),
+          shipping_date   = COALESCE($2, shipping_date)
+         WHERE shipment_id = (SELECT shipment_id FROM orders WHERE order_id = $3)`,
+        [shippingMethod || null, shippingDate || null, order_id]
+      );
+    }
 
-    // Create PDF document
-    const doc = new PDFDocument({ size: 'A4', margin: 50 });
+    // Email notification for key status changes
+    if (order_status && ["PROCESSING","SHIPPED","DELIVERED","CANCELLED"].includes(order_status)) {
+      const { rows } = await query(
+        "SELECT email FROM orders WHERE order_id = $1", [order_id]
+      );
+      if (rows.length) {
+        const { subject, html } = orderStatusUpdateTemplate({
+          order: { orderId: order_id }, items: [], newStatus: order_status,
+        });
+        sendEmail(null, rows[0].email, subject, html).catch(console.error);
+      }
+    }
 
-    const filename = `invoice-${order.orderId || order.order_id}.pdf`;
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    return res.json({ message: "Order updated" });
+  } catch (err) {
+    console.error("updateOrderStatus:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+};
 
+// ── User Cancel Order ─────────────────────────────────────────────────────────
+
+const userCancelOrder = async (req, res) => {
+  const { orderId } = req.params;
+  const userEmail   = req.user?.email;
+  if (!userEmail) return res.status(401).json({ error: "Unauthenticated" });
+
+  try {
+    const { rows } = await query(
+      "SELECT * FROM orders WHERE (order_id_str = $1 OR order_id::text = $1) AND email = $2",
+      [orderId.trim(), userEmail.toLowerCase()]
+    );
+    if (!rows.length) return res.status(404).json({ error: "Order not found" });
+
+    const order            = rows[0];
+    const CANCELLABLE      = ["COD_PENDING", "PENDING", "PROCESSING"];
+    if (!CANCELLABLE.includes(order.order_status))
+      return res.status(400).json({ error: `Cannot cancel order in status: ${order.order_status}` });
+
+    await query(
+      "UPDATE orders SET order_status = 'CANCELLED', updated_at = NOW() WHERE order_id = $1",
+      [order.order_id]
+    );
+
+    return res.json({ message: "Order cancelled" });
+  } catch (err) {
+    console.error("userCancelOrder:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+// ── Invoice PDF ───────────────────────────────────────────────────────────────
+
+const getInvoice = async (req, res) => {
+  const rawId = (req.params.orderId || "").trim();
+  if (!rawId) return res.status(400).send("Missing order ID");
+
+  try {
+    const { rows } = await query(
+      `SELECT o.*, s.shipping_name, s.shipping_address, s.shipping_city,
+              s.shipping_state, s.shipping_country
+       FROM orders o
+       LEFT JOIN shipments s ON s.shipment_id = o.shipment_id
+       WHERE o.order_id_str = $1 OR o.order_id::text = $1`,
+      [rawId]
+    );
+    if (!rows.length) return res.status(404).send("Order not found");
+    const order = rows[0];
+
+    const { rows: items } = await query(
+      `SELECT oi.*, pr.part_number FROM order_items oi
+       LEFT JOIN products pr ON pr.product_id = oi.product_id
+       WHERE oi.order_id = $1`,
+      [order.order_id]
+    );
+
+    const doc = new PDFDocument({ size: "A4", margin: 50 });
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="invoice-${rawId}.pdf"`);
     doc.pipe(res);
 
-    // Header
-    doc.fontSize(20).text('Invoice', { align: 'left' });
-    doc.moveDown();
+    doc.fontSize(20).text("Invoice", { align: "left" }).moveDown();
+    doc.fontSize(12).text(`Order: ${order.order_id_str || order.order_id}`);
+    doc.text(`Date: ${order.created_at}`);
+    doc.text(`Email: ${order.email}`);
+    doc.text(`Tracking: ${order.tracking_number || ""}`).moveDown();
+    doc.fontSize(14).text("Shipping").fontSize(10);
+    doc.text(`${order.shipping_name || ""}`);
+    doc.text(`${order.shipping_address || ""}`);
+    doc.text(`${order.shipping_city || ""} ${order.shipping_state || ""} ${order.shipping_country || ""}`).moveDown();
 
-    // Order metadata
-    doc.fontSize(12).text(`Order: ${order.orderId || order.order_id}`);
-    doc.text(`Date: ${order.createdAt}`);
-    doc.text(`Email: ${order.email || order.user?.email || ''}`);
-    doc.text(`Tracking: ${order.trackingNumber || ''}`);
-    doc.moveDown();
-
-    // Shipping
-    doc.fontSize(14).text('Shipping Information');
-    doc.fontSize(10).text(`${order.shippingName || ''}`);
-    doc.text(`${order.shippingAddress || ''}`);
-    doc.text(`${order.shippingCity || ''} ${order.shippingState || ''} ${order.shippingCountry || ''}`);
-    doc.moveDown();
-
-    // Items table header
-    doc.fontSize(12).text('Items');
-    doc.moveDown(0.5);
-
-    const items = order.orderItem || [];
+    doc.fontSize(12).text("Items").moveDown(0.5);
     items.forEach((it, idx) => {
-      const name = it.product?.part_number || it.productName || `Product ${it.productId}`;
-      const qty = it.quantity || 1;
-      const price = parseFloat(it.price || 0).toFixed(2);
-      doc.fontSize(10).text(`${idx + 1}. ${name} — Qty: ${qty} — $${price}`);
+      doc.fontSize(10).text(
+        `${idx + 1}. ${it.part_number || it.product_name} — Qty: ${it.quantity} — $${parseFloat(it.price).toFixed(2)}`
+      );
     });
-
     doc.moveDown();
     doc.text(`Subtotal: $${parseFloat(order.subtotal || 0).toFixed(2)}`);
     doc.text(`Shipping: $${parseFloat(order.shipping_cost || 0).toFixed(2)}`);
-    doc.text(`Tax: $${parseFloat(order.tax || 0).toFixed(2)}`);
-    doc.text(`Total: $${parseFloat(order.total_price || order.amount || 0).toFixed(2)}`);
+    doc.text(`Tax:      $${parseFloat(order.tax || 0).toFixed(2)}`);
+    doc.text(`Total:    $${parseFloat(order.total_price || 0).toFixed(2)}`);
 
     doc.end();
   } catch (err) {
-    console.error('getInvoice error:', err);
-    return res.status(500).send('Failed to generate invoice');
+    console.error("getInvoice:", err.message);
+    return res.status(500).send("Failed to generate invoice");
   }
 };
 
+// Deletion disabled – change status to CANCELLED instead
+const deleteOrder = (_req, res) =>
+  res.status(403).json({ message: "Order deletion is prohibited. Use CANCELLED status instead." });
+
 module.exports = {
-  checkout,
-  getAllOrders,
-  trackProgress,
-  updateOrderStatus,
-  userCancelOrder,
-  trackOrders,
-  deleteOrder,
-  trackOrderByTracking,
-  getInvoice,
+  checkout, getAllOrders, trackOrders, trackOrderByTracking,
+  updateOrderStatus, userCancelOrder, deleteOrder, getInvoice,
 };
