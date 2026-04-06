@@ -77,9 +77,6 @@ app.use(
   })
 );
 
-// ── Explicit CORS Preflight Handling ──────────────────────────────────────────
-app.options("*", cors());
-
 // ── Rate Limiting ─────────────────────────────────────────────────────────────
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
