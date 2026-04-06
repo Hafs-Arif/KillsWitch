@@ -1,23 +1,46 @@
-const { query } = require("../config/db");
 
-class BrandCategoryModel {
-  static async create(id, brandId, categoryId, subCategoryId) {
-    await query(
-      `INSERT INTO brand_categories (id, brand_id, category_id, sub_category_id, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, NOW(), NOW())
-       ON CONFLICT (id) DO UPDATE SET 
-         brand_id = COALESCE(EXCLUDED.brand_id, brand_id),
-         category_id = COALESCE(EXCLUDED.category_id, category_id),
-         sub_category_id = COALESCE(EXCLUDED.sub_category_id, sub_category_id),
-         updated_at = NOW()`,
-      [id, brandId, categoryId, subCategoryId]
-    );
-  }
+module.exports = (sequelize, DataTypes) => {
+  const brandcategory = sequelize.define('brandcategory', {
+    id:{
+      type:DataTypes.INTEGER,
+      primaryKey:true,
+      //autoIncrement: true
+  },
+    brand_id: {
+      type: DataTypes.INTEGER,
+      allowNull: false
+    },
+    category_id: {
+      type: DataTypes.INTEGER,
+      allowNull: false
+    },
+    sub_category_id: {
+      type: DataTypes.INTEGER,
+      allowNull: false
+    }
+  }, {
+    tableName: 'brandcategory' // <-- optional, force specific table name
+  });
+  brandcategory.associate = (models) => {
+    brandcategory.hasMany(models.product, {
+      foreignKey: 'brandcategoryId',
+      as: 'product'
+    });
 
-  static async findAll() {
-    const { rows } = await query(`SELECT * FROM brand_categories ORDER BY id`);
-    return rows;
-  }
-}
-
-module.exports = { BrandCategoryModel };
+    brandcategory.belongsTo(models.brand, {
+      foreignKey: 'brand_id',
+      as: 'brand',
+      onDelete: 'CASCADE',  // optional: handle deletion behavior
+      onUpdate: 'CASCADE' 
+    });
+    brandcategory.belongsTo(models.category, {
+      foreignKey: 'category_id',
+      as: 'category'
+    });
+    brandcategory.belongsTo(models.subcategory, {
+      foreignKey: 'sub_category_id',
+      as: 'subcategory'
+    });
+  };
+   return brandcategory;
+};

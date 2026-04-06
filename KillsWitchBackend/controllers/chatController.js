@@ -1,201 +1,331 @@
-// controllers/chatController.js  –  raw SQL (pg)
-"use strict";
+const { ChatMessage, User } = require('../models');
+const { Op } = require('sequelize');
+const messageCleanupService = require('../services/messageCleanupService');
+const crypto = require('crypto');
 
-const { query }  = require("../config/db");
- 
-const messageCleanupService = require("../services/messageCleanupService");
+// Helper function to generate message hash for deduplication
+const generateMessageHash = (senderEmail, receiverEmail, message, timestamp) => {
+  const data = `${senderEmail}:${receiverEmail}:${message}:${timestamp}`;
+  return crypto.createHash('md5').update(data).digest('hex');
+};
 
-const getAdmins = async (_req, res) => {
+const getAdmins = async (req, res) => {
   try {
-    const { rows } = await query(
-      "SELECT id, email, name FROM users WHERE role = 'admin' ORDER BY name"
-    );
-    return res.json(rows);
-  } catch (err) {
-    console.error("getAdmins:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    const admins = await User.findAll({ where: { role: 'admin' }, attributes: ['email', 'name', 'id'] });
+    return res.json(admins);
+  } catch (e) {
+    return res.status(500).json({ error: 'Failed to fetch admins' });
   }
 };
 
 const getConversations = async (req, res) => {
-  const { adminEmail } = req.query;
-  if (!adminEmail) return res.status(400).json({ error: "adminEmail is required" });
-
   try {
-    const { rows } = await query(
-      `SELECT DISTINCT ON (other_party)
-         CASE
-           WHEN "senderEmail" = $1 THEN "receiverEmail"
-           ELSE "senderEmail"
-         END AS other_party,
-         message AS last_message,
-         "createdAt" AS last_message_time
-       FROM chat_messages
-       WHERE "senderEmail" = $1 OR "receiverEmail" = $1 OR "receiverEmail" = 'admin'
-       ORDER BY other_party, "createdAt" DESC`,
-      [adminEmail]
-    );
+    const { adminEmail } = req.query;
+    if (!adminEmail) return res.status(400).json({ error: 'adminEmail is required' });
 
-    const conversations = rows
-      .filter(r => r.other_party && r.other_party !== adminEmail && r.other_party !== "admin")
-      .map(r => ({
-        email:           r.other_party,
-        isGuest:         r.other_party.startsWith("guest_"),
-        lastMessage:     r.last_message,
-        lastMessageTime: r.last_message_time,
-      }));
+    console.log(`[CHAT] Getting conversations for admin: ${adminEmail}`);
 
-    return res.json(conversations);
-  } catch (err) {
-    console.error("getConversations:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    const msgs = await ChatMessage.findAll({
+      where: {
+        [Op.or]: [
+          { senderEmail: adminEmail },
+          { receiverEmail: adminEmail },
+          { receiverEmail: 'admin' },
+          { receiverEmail: null }
+        ]
+      },
+      order: [['createdAt', 'DESC']]
+    });
+
+    console.log(`[CHAT] Found ${msgs.length} total messages for admin conversations`);
+
+    const users = new Map();
+    msgs.forEach(m => {
+      let other;
+      if (m.senderEmail === adminEmail) {
+        // Message from admin to user
+        other = m.receiverEmail;
+      } else {
+        // Message from user to admin (including guest users)
+        other = m.senderEmail;
+      }
+      
+      if (other && other !== adminEmail && other !== 'admin' && other !== null) {
+        if (!users.has(other)) {
+          users.set(other, { 
+            email: other,
+            isGuest: other.startsWith('guest_'),
+            lastMessage: m.message,
+            lastMessageTime: m.createdAt
+          });
+          console.log(`[CHAT] Added conversation with user: ${other} (guest: ${other.startsWith('guest_')})`);
+        }
+      }
+    });
+
+    console.log(`[CHAT] Returning ${users.size} conversations`);
+    return res.json(Array.from(users.values()));
+  } catch (e) {
+    console.error('[CHAT] Error fetching conversations:', e);
+    return res.status(500).json({ error: 'Failed to fetch conversations' });
   }
 };
 
 const getMessages = async (req, res) => {
-  const { adminEmail, userEmail } = req.query;
-  if (!adminEmail || !userEmail) return res.status(400).json({ error: "adminEmail and userEmail required" });
-
   try {
-    const { rows } = await query(
-      `SELECT * FROM chat_messages
-       WHERE
-         ("senderEmail" = $1 AND "receiverEmail" = $2) OR
-         ("senderEmail" = $2 AND "receiverEmail" = $1) OR
-         ("senderEmail" = $2 AND "receiverEmail" IN ('admin', NULL))
-       ORDER BY "createdAt" ASC`,
-      [adminEmail, userEmail]
-    );
-    return res.json(rows);
-  } catch (err) {
-    console.error("getMessages:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    const { adminEmail, userEmail } = req.query;
+    if (!adminEmail || !userEmail) return res.status(400).json({ error: 'adminEmail and userEmail are required' });
+
+    console.log(`[CHAT] Getting messages between admin: ${adminEmail} and user: ${userEmail}`);
+
+    const messages = await ChatMessage.findAll({
+      where: {
+        [Op.or]: [
+          // Messages from admin to user
+          { senderEmail: adminEmail, receiverEmail: userEmail },
+          // Messages from user to admin (specific admin)
+          { senderEmail: userEmail, receiverEmail: adminEmail },
+          // Messages from user to admin (generic admin or null - for guest users)
+          { 
+            senderEmail: userEmail, 
+            [Op.or]: [
+              { receiverEmail: 'admin' },
+              { receiverEmail: null }
+            ]
+          }
+        ]
+      },
+      order: [['createdAt', 'ASC']]
+    });
+
+    console.log(`[CHAT] Found ${messages.length} messages for conversation ${userEmail} <-> ${adminEmail}`);
+    return res.json(messages);
+  } catch (e) {
+    console.error('[CHAT] Error fetching messages:', e);
+    return res.status(500).json({ error: 'Failed to fetch messages' });
   }
 };
 
+// Send a new chat message
 const sendMessage = async (req, res) => {
-  const { senderEmail, receiverEmail, message } = req.body;
-  if (!senderEmail || !receiverEmail || !message)
-    return res.status(400).json({ error: "senderEmail, receiverEmail, message are required" });
-
   try {
-    const { rows } = await query(
-      `INSERT INTO chat_messages ("senderEmail", "receiverEmail", message, "createdAt", "updatedAt")
-       VALUES ($1,$2,$3,NOW(),NOW()) RETURNING *`,
-      [senderEmail, receiverEmail, message.slice(0, 4000)]
-    );
-    return res.status(201).json({ message: "Message sent", data: rows[0] });
+    const { senderEmail, receiverEmail, message } = req.body;
+
+    if (!senderEmail || !receiverEmail || !message) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+
+    const newMessage = await ChatMessage.create({
+      senderEmail,
+      receiverEmail,
+      message,
+    });
+
+    return res.status(201).json({ message: 'Message sent', data: newMessage });
   } catch (err) {
-    console.error("sendMessage:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    console.error('Send Message Error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 };
 
+// Get chat history between two users
 const getMessagesBetweenUsers = async (req, res) => {
-  const { user1, user2 } = req.query;
-  if (!user1 || !user2) return res.status(400).json({ error: "user1 and user2 required" });
-
   try {
-    const { rows } = await query(
-      `SELECT * FROM chat_messages
-       WHERE ("senderEmail"=$1 AND "receiverEmail"=$2)
-          OR ("senderEmail"=$2 AND "receiverEmail"=$1)
-       ORDER BY "createdAt" ASC`,
-      [user1, user2]
-    );
-    return res.json({ messages: rows });
+    const { user1, user2 } = req.query;
+
+    if (!user1 || !user2) {
+      return res.status(400).json({ error: 'Both user emails are required' });
+    }
+
+    const messages = await ChatMessage.findAll({
+      where: {
+        [Op.or]: [
+          { senderEmail: user1, receiverEmail: user2 },
+          { senderEmail: user2, receiverEmail: user1 },
+        ],
+      },
+      order: [['createdAt', 'ASC']],
+    });
+
+    return res.status(200).json({ messages });
   } catch (err) {
-    console.error("getMessagesBetweenUsers:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    console.error('Fetch Chat History Error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 };
 
-const triggerCleanup = async (_req, res) => {
+// Manual cleanup trigger (admin only)
+const triggerCleanup = async (req, res) => {
   try {
     await messageCleanupService.manualCleanup();
     const stats = await messageCleanupService.getCleanupStats();
-    return res.json({ message: "Cleanup complete", stats });
-  } catch (err) {
-    console.error("triggerCleanup:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    return res.json({ 
+      message: 'Cleanup completed successfully', 
+      stats 
+    });
+  } catch (error) {
+    console.error('Manual cleanup error:', error);
+    return res.status(500).json({ error: 'Failed to perform cleanup' });
   }
 };
 
-const getCleanupStats = async (_req, res) => {
+// Get cleanup statistics
+const getCleanupStats = async (req, res) => {
   try {
     const stats = await messageCleanupService.getCleanupStats();
     return res.json(stats);
-  } catch (err) {
-    console.error("getCleanupStats:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+  } catch (error) {
+    console.error('Get cleanup stats error:', error);
+    return res.status(500).json({ error: 'Failed to get cleanup stats' });
   }
 };
 
+// Get offline messages for admin when they come online
 const getOfflineMessages = async (req, res) => {
-  const { adminEmail } = req.query;
-  if (!adminEmail) return res.status(400).json({ error: "adminEmail required" });
-
   try {
-    const { rows } = await query(
-      `SELECT DISTINCT ON ("senderEmail") *
-       FROM chat_messages
-       WHERE ("receiverEmail" = $1 OR "receiverEmail" = 'admin')
-         AND "isOfflineMessage" = true AND "seenByAdmin" = false
-       ORDER BY "senderEmail", "createdAt" DESC`,
-      [adminEmail]
-    );
-    return res.json({ messages: rows, count: rows.length });
-  } catch (err) {
-    console.error("getOfflineMessages:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-};
-
-const markOfflineMessagesDelivered = async (req, res) => {
-  const { adminEmail, messageIds } = req.body;
-  if (!adminEmail) return res.status(400).json({ error: "adminEmail required" });
-
-  try {
-    let sql, params;
-    if (messageIds?.length) {
-      const ph = messageIds.map((_, n) => `$${n + 1}`).join(",");
-      sql    = `UPDATE chat_messages SET "isOfflineMessage"=false, "deliveredAt"=NOW() WHERE id IN (${ph})`;
-      params = messageIds;
-    } else {
-      sql    = `UPDATE chat_messages SET "isOfflineMessage"=false, "deliveredAt"=NOW()
-                WHERE ("receiverEmail"=$1 OR "receiverEmail"='admin') AND "isOfflineMessage"=true`;
-      params = [adminEmail];
+    const { adminEmail } = req.query;
+    if (!adminEmail) {
+      return res.status(400).json({ error: 'adminEmail is required' });
     }
-    const { rowCount } = await query(sql, params);
-    return res.json({ message: "Marked as delivered", updatedCount: rowCount });
-  } catch (err) {
-    console.error("markOfflineMessagesDelivered:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+
+    console.log(`[CHAT] Getting offline messages for admin: ${adminEmail}`);
+
+    // Get messages sent to admin while they were offline AND not seen yet
+    const offlineMessages = await ChatMessage.findAll({
+      where: {
+        [Op.and]: [
+          {
+            [Op.or]: [
+              { receiverEmail: adminEmail },
+              { receiverEmail: 'admin' },
+              { receiverEmail: null }
+            ]
+          },
+          { isOfflineMessage: true },
+          { seenByAdmin: false } // Only unseen messages
+        ]
+      },
+      order: [['createdAt', 'ASC']]
+    });
+
+    console.log(`[CHAT] Found ${offlineMessages.length} unseen offline messages for ${adminEmail}`);
+
+    // Group messages by sender to avoid showing duplicate conversations
+    const messagesBySender = new Map();
+    offlineMessages.forEach(msg => {
+      if (!messagesBySender.has(msg.senderEmail)) {
+        messagesBySender.set(msg.senderEmail, []);
+      }
+      messagesBySender.get(msg.senderEmail).push(msg);
+    });
+
+    // Return only the latest message from each sender to avoid overwhelming the admin
+    const uniqueMessages = Array.from(messagesBySender.values()).map(messages => {
+      return messages[messages.length - 1]; // Get the latest message from each sender
+    });
+
+    console.log(`[CHAT] Returning ${uniqueMessages.length} unique offline messages from ${messagesBySender.size} senders`);
+
+    return res.json({
+      messages: uniqueMessages,
+      count: uniqueMessages.length,
+      totalOfflineMessages: offlineMessages.length
+    });
+  } catch (error) {
+    console.error('Get offline messages error:', error);
+    return res.status(500).json({ error: 'Failed to get offline messages' });
   }
 };
 
-const markMessagesAsSeen = async (req, res) => {
-  const { adminEmail, userEmail } = req.body;
-  if (!adminEmail || !userEmail) return res.status(400).json({ error: "adminEmail and userEmail required" });
-
+// Mark offline messages as delivered
+const markOfflineMessagesDelivered = async (req, res) => {
   try {
-    const { rowCount } = await query(
-      `UPDATE chat_messages
-       SET "seenByAdmin"=true, "seenAt"=NOW(), "isOfflineMessage"=false
-       WHERE "senderEmail"=$1
-         AND ("receiverEmail"=$2 OR "receiverEmail"='admin')
-         AND "seenByAdmin"=false`,
-      [userEmail, adminEmail]
+    const { adminEmail, messageIds } = req.body;
+    if (!adminEmail) {
+      return res.status(400).json({ error: 'adminEmail is required' });
+    }
+
+    let whereClause = {
+      isOfflineMessage: true
+    };
+
+    if (messageIds && messageIds.length > 0) {
+      // Mark specific messages as delivered
+      whereClause.id = { [Op.in]: messageIds };
+    } else {
+      // Mark all offline messages for this admin as delivered
+      whereClause[Op.or] = [
+        { receiverEmail: adminEmail },
+        { receiverEmail: 'admin' }
+      ];
+    }
+
+    const updatedCount = await ChatMessage.update(
+      { isOfflineMessage: false, deliveredAt: new Date() },
+      { where: whereClause }
     );
-    return res.json({ message: "Marked as seen", updatedCount: rowCount });
-  } catch (err) {
-    console.error("markMessagesAsSeen:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+
+    return res.json({
+      message: 'Offline messages marked as delivered',
+      updatedCount: updatedCount[0]
+    });
+  } catch (error) {
+    console.error('Mark offline messages delivered error:', error);
+    return res.status(500).json({ error: 'Failed to mark messages as delivered' });
+  }
+};
+
+// Mark messages as seen by admin when they open a conversation
+const markMessagesAsSeen = async (req, res) => {
+  try {
+    const { adminEmail, userEmail } = req.body;
+    if (!adminEmail || !userEmail) {
+      return res.status(400).json({ error: 'adminEmail and userEmail are required' });
+    }
+
+    console.log(`[CHAT] Marking messages as seen for conversation: ${userEmail} -> ${adminEmail}`);
+
+    // Mark all messages from this user to admin as seen
+    const updatedCount = await ChatMessage.update(
+      { 
+        seenByAdmin: true, 
+        seenAt: new Date(),
+        isOfflineMessage: false // Also mark as no longer offline since admin has seen them
+      },
+      { 
+        where: {
+          senderEmail: userEmail,
+          [Op.or]: [
+            { receiverEmail: adminEmail },
+            { receiverEmail: 'admin' },
+            { receiverEmail: null }
+          ],
+          seenByAdmin: false
+        }
+      }
+    );
+
+    console.log(`[CHAT] Marked ${updatedCount[0]} messages as seen`);
+
+    return res.json({
+      message: 'Messages marked as seen',
+      updatedCount: updatedCount[0]
+    });
+  } catch (error) {
+    console.error('Mark messages as seen error:', error);
+    return res.status(500).json({ error: 'Failed to mark messages as seen' });
   }
 };
 
 module.exports = {
-  getAdmins, getConversations, getMessages, sendMessage,
-  getMessagesBetweenUsers, triggerCleanup, getCleanupStats,
-  getOfflineMessages, markOfflineMessagesDelivered, markMessagesAsSeen,
+  getAdmins,
+  getConversations,
+  getMessages,
+  sendMessage,
+  getMessagesBetweenUsers,
+  triggerCleanup,
+  getCleanupStats,
+  getOfflineMessages,
+  markOfflineMessagesDelivered,
+  markMessagesAsSeen,
 };

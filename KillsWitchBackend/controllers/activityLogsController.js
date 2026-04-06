@@ -1,102 +1,80 @@
-"use strict";
-
-const { query } = require("../config/db");
-
-// ── Find logs by order_id (JSONB containment) ─────────────────────────────────
+const { Op } = require("sequelize");
+const { literal } = require("sequelize");
+const { ActivityLog, User } = require("../models");
 
 const findByOrder = async (req, res) => {
-  const rawId = req.query.order_id;
-  if (!rawId) return res.status(400).json({ message: "order_id is required" });
-
-  const orderId = parseInt(rawId, 10);
-  if (isNaN(orderId) || orderId <= 0)
-    return res.status(400).json({ message: "order_id must be a positive integer" });
+  const { order_id } = req.query;
+  if (!order_id) {
+    return res.status(400).json({ message: "Order ID is required" });
+  }
 
   try {
-    // $1::jsonb safely casts the parameter – no interpolation of user data into the SQL string
-    const { rows } = await query(
-      `SELECT * FROM activity_logs
-       WHERE details @> $1::jsonb
-       ORDER BY created_at DESC`,
-      [JSON.stringify({ order_id: orderId })]
-    );
-    return res.json(rows);
+    const logs = await ActivityLog.findAll({
+      // details is JSONB; look for { order_id: <number> } inside it
+      where: literal(
+        `details @> '${JSON.stringify({
+          order_id: parseInt(order_id),
+        })}'::jsonb`
+      ),
+    });
+    res.json(logs);
   } catch (err) {
-    console.error("findByOrder:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    res.status(500).json({ error: err.message });
   }
 };
 
-// ── Get all logs ──────────────────────────────────────────────────────────────
-
-const findAllLogs = async (_req, res) => {
+const findAllLogs = async (req, res) => {
   try {
-    const { rows } = await query(
-      "SELECT * FROM activity_logs ORDER BY created_at DESC"
-    );
-    return res.json(rows);
+    const logs = await ActivityLog.findAll();
+    res.json(logs);
   } catch (err) {
-    console.error("findAllLogs:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    res.status(500).json({ error: err.message });
   }
 };
-
-// ── Find a user by id ─────────────────────────────────────────────────────────
-
 const findUser = async (req, res) => {
-  const rawId = req.query.user_id;
-  if (!rawId) return res.status(400).json({ message: "user_id is required" });
-
-  const id = parseInt(rawId, 10);
-  if (isNaN(id) || id <= 0)
-    return res.status(400).json({ message: "user_id must be a positive integer" });
+  const { user_id } = req.query;
 
   try {
-    const { rows } = await query(
-      // Never return password, refresh_token, etc.
-      "SELECT id, name, email, role, phoneno, created_at FROM users WHERE id = $1",
-      [id]
-    );
-    if (!rows.length) return res.status(404).json({ message: "User not found" });
-    return res.json(rows[0]);
+    if (user_id) {
+      const users = await User.findOne({ where: { id: user_id } });
+      if (!users) {
+        return res.status(404).json({ message: "User Not Found" });
+      }
+      return res.json(users);
+    }
+
+    res.status(400).json({ message: "User ID is required" });
   } catch (err) {
-    console.error("findUser:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    res.status(500).json({ error: err.message });
   }
 };
-
-// ── Get logs by email or order_id ─────────────────────────────────────────────
-
 const getActivityLogs = async (req, res) => {
   const { email, order_id } = req.query;
 
   try {
-    if (order_id) {
-      const id = parseInt(order_id, 10);
-      if (isNaN(id)) return res.status(400).json({ message: "Invalid order_id" });
+    let activityLogs;
 
-      const { rows } = await query(
-        "SELECT * FROM activity_logs WHERE order_id = $1 ORDER BY created_at DESC",
-        [id]
-      );
-      return res.json(rows);
+    if (order_id) {
+      activityLogs = await ActivityLog.findAll({
+        where: { order_id },
+        order: [["created_at", "DESC"]],
+      });
+      return res.json(activityLogs);
     }
 
     if (email) {
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
-        return res.status(400).json({ message: "Invalid email format" });
-
-      const { rows } = await query(
-        "SELECT * FROM activity_logs WHERE user_email = $1 ORDER BY created_at DESC",
-        [email.toLowerCase()]
-      );
-      return res.json(rows);
+      activityLogs = await ActivityLog.findAll({
+        where: { user_email: email },
+        order: [["created_at", "DESC"]],
+      });
+      return res.json(activityLogs);
     }
 
-    return res.status(400).json({ message: "Provide either email or order_id" });
+    res
+      .status(400)
+      .json({ message: "Please provide either email or order_id" });
   } catch (err) {
-    console.error("getActivityLogs:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    res.status(500).json({ error: err.message });
   }
 };
 

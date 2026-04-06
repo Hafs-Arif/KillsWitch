@@ -1,7 +1,7 @@
 const express = require('express');
 
 const router = express.Router();
-const { handleQuoteRequest } = require("../controllers/quoteController");
+const { handleQuoteRequest } = require("../controllers/qouteController");
 
 
 router.post('/', handleQuoteRequest);

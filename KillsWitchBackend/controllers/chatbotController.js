@@ -1,120 +1,175 @@
-const OpenAIChatbotService = require('../services/fallbackChatbotService');
+const DeepSeekChatbotService = require('../services/geminiChatbotService');
+const FallbackChatbotService = require('../services/fallbackChatbotService');
 
 class ChatbotController {
 
   constructor() {
-    this.chatbotService = new OpenAIChatbotService();
+    this.deepSeekService = new DeepSeekChatbotService();
+    this.fallbackService = new FallbackChatbotService();
     this.conversationHistory = new Map();
-    this.MAX_HISTORY = 20;
   }
 
-  // ─── Helpers ───────────────────────────────────────────────
-
-  _getConversationKey({ sessionId, userEmail }) {
-    return sessionId || userEmail || 'anonymous';
-  }
-
-  _normalizeResponse(response) {
-    return typeof response === 'string'
-      ? { text: response, buttons: [] }
-      : response;
-  }
-
-  _getHistory(key) {
-    return this.conversationHistory.get(key) || [];
-  }
-
-  _saveHistory(key, history, userMessage, botText) {
-    history.push(
-      { role: 'user', content: userMessage },
-      { role: 'assistant', content: botText }
-    );
-
-    if (history.length > this.MAX_HISTORY) {
-      history = history.slice(-this.MAX_HISTORY);
-    }
-
-    this.conversationHistory.set(key, history);
-  }
-
-  // ─── Routes ────────────────────────────────────────────────
-
-  getWelcome = async (_req, res) => {
+  // Welcome Message
+  getWelcome = async (req, res) => {
     try {
-      const welcomeMessage = this.chatbotService.getWelcomeMessage();
-      const payload = this._normalizeResponse(welcomeMessage);
+      const welcomeMessage = this.fallbackService.getWelcomeMessage();
 
-      res.json({ success: true, message: payload, type: 'welcome' });
+      const payload = typeof welcomeMessage === "string"
+        ? { text: welcomeMessage, buttons: [] }
+        : welcomeMessage;
+
+      res.json({
+        success: true,
+        message: payload,
+        type: "welcome"
+      });
+
     } catch (error) {
-      console.error('Error getting welcome message:', error);
-      res.status(500).json({ success: false, error: 'Failed to get welcome message' });
+      console.error("Error getting welcome message:", error);
+      res.status(500).json({
+        success: false,
+        error: "Failed to get welcome message"
+      });
     }
   };
 
+  // Send Message
   sendMessage = async (req, res) => {
     try {
+
       const { message, sessionId, userEmail } = req.body;
 
-      if (!message?.trim()) {
-        return res.status(400).json({ success: false, error: 'Message is required' });
+      if (!message || !message.trim()) {
+        return res.status(400).json({
+          success: false,
+          error: "Message is required"
+        });
       }
 
-      const conversationKey = this._getConversationKey({ sessionId, userEmail });
-      const history = this._getHistory(conversationKey);
+      const conversationKey = sessionId || userEmail || "anonymous";
+
+      let history = this.conversationHistory.get(conversationKey) || [];
 
       let botResponse;
 
       try {
-        botResponse = await this.chatbotService.generateResponse(message, history);
+        console.log("Using OpenAI powered chatbot...");
+
+        botResponse = await this.fallbackService.generateResponse(
+          message,
+          history
+        );
+
+        console.log("OpenAI response generated");
+
       } catch (error) {
-        console.error('OpenAI failed:', error.message);
+        console.error("OpenAI failed, using fallback:", error.message);
+
         botResponse = {
           text: "⚠️ I'm experiencing technical issues. Please try again later.",
           buttons: []
         };
       }
 
-      const normalized = this._normalizeResponse(botResponse);
-      this._saveHistory(conversationKey, history, message, normalized.text);
+      // Normalize response
+      const normalizedResponse =
+        typeof botResponse === "string"
+          ? { text: botResponse, buttons: [] }
+          : botResponse;
+
+      // Save only text to history (important fix)
+      history.push(
+        { role: "user", content: message },
+        { role: "assistant", content: normalizedResponse.text }
+      );
+
+      if (history.length > 20) {
+        history = history.slice(-20);
+      }
+
+      this.conversationHistory.set(conversationKey, history);
 
       res.json({
         success: true,
-        message: normalized,
-        type: 'chatbot_response',
+        message: normalizedResponse,
+        type: "chatbot_response",
         sessionId: conversationKey
       });
+
     } catch (error) {
-      console.error('Error processing chatbot message:', error);
+
+      console.error("Error processing chatbot message:", error);
+
       res.status(500).json({
         success: false,
-        message: "I apologize, but I'm experiencing technical difficulties. Please try again later."
+        message:
+          "I apologize, but I'm experiencing technical difficulties. Please try again later."
       });
     }
   };
 
+  // Product Search
   searchProducts = async (req, res) => {
     try {
+
       const { query } = req.query;
 
-      if (!query?.trim()) {
-        return res.status(400).json({ success: false, error: 'Search query is required' });
+      if (!query || !query.trim()) {
+        return res.status(400).json({
+          success: false,
+          error: "Search query is required"
+        });
       }
 
-      const products = await this.chatbotService.searchProducts(query);
+      let products;
 
-      res.json({ success: true, products, query });
+      try {
+        products = await this.deepSeekService.searchProducts(query);
+      } catch (error) {
+        console.log("Using fallback for search:", error.message);
+        products = await this.fallbackService.searchProducts(query);
+      }
+
+      res.json({
+        success: true,
+        products,
+        query
+      });
+
     } catch (error) {
-      console.error('Error searching products:', error);
-      res.status(500).json({ success: false, error: 'Failed to search products' });
+
+      console.error("Error searching products:", error);
+
+      res.status(500).json({
+        success: false,
+        error: "Failed to search products"
+      });
     }
   };
 
-  getKnowledgeBase = async (_req, res) => {
+  // Knowledge Base
+  getKnowledgeBase = async (req, res) => {
     try {
-      const [products, brandCategories] = await Promise.all([
-        this.chatbotService.getProductKnowledge(),
-        this.chatbotService.getBrandCategories()
-      ]);
+
+      let products;
+      let brandCategories;
+
+      try {
+
+        [products, brandCategories] = await Promise.all([
+          this.deepSeekService.getProductKnowledge(),
+          this.deepSeekService.getBrandCategories()
+        ]);
+
+      } catch (error) {
+
+        console.log("Using fallback for knowledge base:", error.message);
+
+        [products, brandCategories] = await Promise.all([
+          this.fallbackService.getProductKnowledge(),
+          this.fallbackService.getBrandCategories()
+        ]);
+      }
 
       res.json({
         success: true,
@@ -126,33 +181,68 @@ class ChatbotController {
           sampleProducts: products.slice(0, 10)
         }
       });
+
     } catch (error) {
-      console.error('Error getting knowledge base:', error);
-      res.status(500).json({ success: false, error: 'Failed to get knowledge base' });
+
+      console.error("Error getting knowledge base:", error);
+
+      res.status(500).json({
+        success: false,
+        error: "Failed to get knowledge base"
+      });
     }
   };
 
+  // Clear Chat History
   clearHistory = async (req, res) => {
     try {
-      const conversationKey = this._getConversationKey(req.body);
+
+      const { sessionId, userEmail } = req.body;
+
+      const conversationKey = sessionId || userEmail || "anonymous";
+
       this.conversationHistory.delete(conversationKey);
 
-      res.json({ success: true, message: 'Conversation history cleared' });
+      res.json({
+        success: true,
+        message: "Conversation history cleared"
+      });
+
     } catch (error) {
-      console.error('Error clearing history:', error);
-      res.status(500).json({ success: false, error: 'Failed to clear history' });
+
+      console.error("Error clearing history:", error);
+
+      res.status(500).json({
+        success: false,
+        error: "Failed to clear history"
+      });
     }
   };
 
+  // Get Chat History
   getHistory = async (req, res) => {
     try {
-      const conversationKey = this._getConversationKey(req.query);
-      const history = this._getHistory(conversationKey);
 
-      res.json({ success: true, history, sessionId: conversationKey });
+      const { sessionId, userEmail } = req.query;
+
+      const conversationKey = sessionId || userEmail || "anonymous";
+
+      const history = this.conversationHistory.get(conversationKey) || [];
+
+      res.json({
+        success: true,
+        history,
+        sessionId: conversationKey
+      });
+
     } catch (error) {
-      console.error('Error getting history:', error);
-      res.status(500).json({ success: false, error: 'Failed to get history' });
+
+      console.error("Error getting history:", error);
+
+      res.status(500).json({
+        success: false,
+        error: "Failed to get history"
+      });
     }
   };
 }

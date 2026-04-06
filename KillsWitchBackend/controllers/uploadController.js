@@ -1,237 +1,195 @@
-"use strict";
-
-const xlsx           = require("xlsx");
-const { query }      = require("../config/db");
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-function parseSheet(filePath) {
-  const workbook  = xlsx.readFile(filePath);
-  const sheetName = workbook.SheetNames[0];
-  if (!sheetName) throw new Error("Uploaded file contains no sheets");
-  return xlsx.utils.sheet_to_json(workbook.Sheets[sheetName]);
-}
-
-function requireFile(req) {
-  if (!req.file) {
-    const err  = new Error("No file uploaded");
-    err.status = 400;
-    throw err;
-  }
-}
-
-// ── Bulk Upload Products ──────────────────────────────────────────────────────
+const { Workbook } = require("exceljs");
+const {
+  product,
+  subcategory,
+  brand,
+  category,
+  brandcategory,
+} = require("../models");
+const xlsx = require("xlsx");
+const path = require("path");
 
 exports.uploadBulkData = async (req, res) => {
   try {
-    requireFile(req);
-    const data = parseSheet(req.file.path);
-
-    if (!data.length) {
-      return res.status(400).json({ error: "File contains no data rows" });
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
     }
 
-    const valuePlaceholders = [];
-    const vals = [];
-    let idx = 1;
+    const workbook = xlsx.readFile(req.file.path);
+    const sheetName = workbook.SheetNames[0];
+    const sheet = workbook.Sheets[sheetName];
+    const data = xlsx.utils.sheet_to_json(sheet); 
+    console.log("Sample row keys:", Object.keys(data[0]));
 
-    for (const row of data) {
-      const partNumber = String(row["Part Number"] || row["part_number"] || "").trim();
-      const productId  = parseInt(row["product_id"] || row["Product_id"] || 0, 10);
+    const products = data.map((row, index) => {
+      const part_number = String(
+        row["Part Number"] || row["part_number"] || ""
+      ).trim();
+      const product_id = Number(row["product_id"] || row["Product_id"] || 0);
+      const brandCategory =
+        row["brand_category"] || row["Brand Category"] || "";
+      const condition = row["Condition"] || row["condition"] || "";
+      const sub_condition = row["sub_condition"] || row["Sub Condtion"] || "";
+      const price = Number(row["price"] || 0);
+      const quantity = Number(row["quantity"] || 0);
+      const shortDesc = row["short_description"] || "";
+      const longDesc = row["long_description"] || "";
+      const status = row["status"] || "";
 
-      valuePlaceholders.push(
-        `($${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++},
-          $${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, NOW(), NOW())`
-      );
-      vals.push(
-        productId,
-        partNumber,
-        parseInt(row["brand_category"] || row["Brand Category"] || 0, 10),
-        `https://killswitch.us/${partNumber}.png`,
-        String(row["Condition"]         || row["condition"]         || ""),
-        String(row["sub_condition"]     || row["Sub Condtion"]      || ""),
-        parseFloat(row["price"]         || 0),
-        parseInt(row["quantity"]        || 0, 10),
-        String(row["short_description"] || ""),
-        String(row["long_description"]  || ""),
-        String(row["status"]            || "")
-      );
-    }
-
-    const { rowCount } = await query(
-      `INSERT INTO products
-         (product_id, part_number, brandcategory_id, image,
-          condition, sub_condition, price, quantity,
-          short_description, long_description, status,
-          created_at, updated_at)
-       VALUES ${valuePlaceholders.join(", ")}`,
-      vals
-    );
-
-    return res.status(201).json({
-      success: true,
-      message: `${rowCount} products created successfully`,
+      return {
+        product_id: product_id,
+        part_number: part_number,
+        brandcategoryId: Number(brandCategory),
+        image: `https://killswitch.us/${part_number}.png`,
+        condition: String(condition),
+        sub_condition: String(sub_condition),
+        price,
+        quantity,
+        short_description: String(shortDesc),
+        long_description: String(longDesc),
+        status: String(status),
+      };
     });
+    console.log(products);
+    const createdProducts = await product.bulkCreate(products);
+    res.json({ message: "Products created successfully", createdProducts });
   } catch (err) {
-    console.error("uploadBulkData:", err.message);
-    return res.status(err.status || 500).json({ error: err.status ? err.message : "Internal server error" });
+    res.status(404).json({ error: err.message });
   }
 };
-
-// ── Bulk Upload Brands ────────────────────────────────────────────────────────
-
 exports.uploadBulkDataBrand = async (req, res) => {
   try {
-    requireFile(req);
-    const data = parseSheet(req.file.path);
-
-    if (!data.length) {
-      return res.status(400).json({ error: "File contains no data rows" });
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
     }
 
-    const valuePlaceholders = [];
-    const vals = [];
-    let idx = 1;
+    const workbook = xlsx.readFile(req.file.path);
+    const sheetName = workbook.SheetNames[0];
+    const sheet = workbook.Sheets[sheetName];
+    const data = xlsx.utils.sheet_to_json(sheet);
+    console.log("Sample row keys:", Object.keys(data[0]));
 
-    for (const row of data) {
-      valuePlaceholders.push(`($${idx++}, $${idx++}, NOW(), NOW())`);
-      vals.push(
-        parseInt(row["brand_id"] || 0, 10),
-        String(row["brand_name"] || "").trim()
-      );
-    }
+    const brands = data.map(async (row, index) => {
+      console.log(`Row ${index}:`, row);
+      const brand_name = String(
+        row["brand_name"] || row["brand_name"] || ""
+      ).trim();
+      const brand_id = Number(row["brand_id"] || row["Brand_id"] || "");
 
-    const { rowCount } = await query(
-      `INSERT INTO brands (brand_id, brand_name, created_at, updated_at)
-       VALUES ${valuePlaceholders.join(", ")}`,
-      vals
-    );
-
-    return res.status(201).json({
-      success: true,
-      message: `${rowCount} brands created successfully`,
+      const createdBrand = await brand.create({
+        brand_name: String(row.brand_name || ""),
+        brand_id: Number(row.brand_id || 0),
+      });
+      return {
+        brand_name: brand_name,
+        brand_id: brand_id,
+      };
     });
+    console.log(brands);
+    //const createdBrand = await brand.bulkCreate(brands);
+
+    res.json({ message: "Products created successfully" });
   } catch (err) {
-    console.error("uploadBulkDataBrand:", err.message);
-    return res.status(err.status || 500).json({ error: err.status ? err.message : "Internal server error" });
+    res.status(404).json({ error: err.message });
   }
 };
-
-// ── Bulk Upload Categories ────────────────────────────────────────────────────
-
 exports.uploadBulkDataCategory = async (req, res) => {
   try {
-    requireFile(req);
-    const data = parseSheet(req.file.path);
-
-    if (!data.length) {
-      return res.status(400).json({ error: "File contains no data rows" });
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
     }
 
-    const valuePlaceholders = [];
-    const vals = [];
-    let idx = 1;
+    const workbook = xlsx.readFile(req.file.path);
+    const sheetName = workbook.SheetNames[0];
+    const sheet = workbook.Sheets[sheetName];
+    const data = xlsx.utils.sheet_to_json(sheet);
+    console.log("Sample row keys:", Object.keys(data[0]));
 
-    for (const row of data) {
-      valuePlaceholders.push(`($${idx++}, $${idx++}, NOW(), NOW())`);
-      vals.push(
-        parseInt(row["product_category_id"] || 0, 10),
-        String(row["category_name"] || "").trim()
+    const brands = data.map(async (row, index) => {
+      const name = String(
+        row["category_name"] || row["brand_name"] || ""
+      ).trim();
+      const category_id = Number(
+        row["product_category_id"] || row["brand_id"] || 0
       );
-    }
+      const createdBrand = await category.create({
+        category_name: String(row.category_name || ""),
+        product_category_id: Number(row.product_category_id || 0),
+      });
 
-    const { rowCount } = await query(
-      `INSERT INTO categories (product_category_id, category_name, created_at, updated_at)
-       VALUES ${valuePlaceholders.join(", ")}`,
-      vals
-    );
-
-    return res.status(201).json({
-      success: true,
-      message: `${rowCount} categories created successfully`,
+      return {
+        category_name: name,
+        product_category_id: category_id,
+      };
     });
+    console.log(brands);
+    //const createdBrand = await category.bulkCreate(brands);
+    res.json({ message: "Products created successfully" });
   } catch (err) {
-    console.error("uploadBulkDataCategory:", err.message);
-    return res.status(err.status || 500).json({ error: err.status ? err.message : "Internal server error" });
+    res.status(404).json({ error: err.message });
   }
 };
-
-// ── Bulk Upload Subcategories ─────────────────────────────────────────────────
-
 exports.uploadBulkDataSubcategory = async (req, res) => {
   try {
-    requireFile(req);
-    const data = parseSheet(req.file.path);
-
-    if (!data.length) {
-      return res.status(400).json({ error: "File contains no data rows" });
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
     }
 
-    const valuePlaceholders = [];
-    const vals = [];
-    let idx = 1;
+    const workbook = xlsx.readFile(req.file.path);
+    const sheetName = workbook.SheetNames[0];
+    const sheet = workbook.Sheets[sheetName];
+    const data = xlsx.utils.sheet_to_json(sheet);
+    console.log("Sample row keys:", Object.keys(data[0]));
 
-    for (const row of data) {
-      valuePlaceholders.push(`($${idx++}, $${idx++}, NOW(), NOW())`);
-      vals.push(
-        parseInt(row["sub_category_id"] || 0, 10),
-        String(row["sub_category_name"] || "").trim()
+    const brands = data.map((row, index) => {
+      const sub_category_id = Number(
+        row["sub_category_id"] || row["brand"] || 0
       );
-    }
+      const sub_category_name = String(
+        row["sub_category_name"] || row["brand"] || ""
+      ).trim();
 
-    const { rowCount } = await query(
-      `INSERT INTO subcategories (sub_category_id, sub_category_name, created_at, updated_at)
-       VALUES ${valuePlaceholders.join(", ")}`,
-      vals
-    );
-
-    return res.status(201).json({
-      success: true,
-      message: `${rowCount} subcategories created successfully`,
+      return {
+        sub_category_name: sub_category_name,
+        sub_category_id: sub_category_id,
+      };
     });
+    console.log(brands);
+    const createdBrand = await subcategory.bulkCreate(brands);
+    res.json({ message: "Products created successfully", createdBrand });
   } catch (err) {
-    console.error("uploadBulkDataSubcategory:", err.message);
-    return res.status(err.status || 500).json({ error: err.status ? err.message : "Internal server error" });
+    res.status(404).json({ error: err.message });
   }
 };
-
-// ── Bulk Upload Brand Categories ──────────────────────────────────────────────
-
 exports.uploadBulkDataBrandcategory = async (req, res) => {
   try {
-    requireFile(req);
-    const data = parseSheet(req.file.path);
-
-    if (!data.length) {
-      return res.status(400).json({ error: "File contains no data rows" });
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
     }
 
-    const valuePlaceholders = [];
-    const vals = [];
-    let idx = 1;
+    const workbook = xlsx.readFile(req.file.path);
+    const sheetName = workbook.SheetNames[0];
+    const sheet = workbook.Sheets[sheetName];
+    const data = xlsx.utils.sheet_to_json(sheet);
+    console.log("Sample row keys:", Object.keys(data[0]));
 
-    for (const row of data) {
-      valuePlaceholders.push(`($${idx++}, $${idx++}, $${idx++}, $${idx++}, NOW(), NOW())`);
-      vals.push(
-        parseInt(row["brand_category_id"] || 0, 10),
-        parseInt(row["brand_id"]          || 0, 10),
-        parseInt(row["category_id"]       || 0, 10),
-        parseInt(row["sub_category_id"]   || 0, 10)
-      );
-    }
+    const brands = data.map((row, index) => {
+      const brandId = Number(row["brand_id"] || row["brand"] || 0);
+      const id = Number(row["brand_category_id"] || 0);
+      const categoryId = Number(row["category_id"] || row["brand"] || 0);
+      const subcategoryId = Number(row["sub_category_id"] || row["brand"] || 0);
 
-    const { rowCount } = await query(
-      `INSERT INTO brand_categories (id, brand_id, category_id, sub_category_id, created_at, updated_at)
-       VALUES ${valuePlaceholders.join(", ")}`,
-      vals
-    );
-
-    return res.status(201).json({
-      success: true,
-      message: `${rowCount} brand categories created successfully`,
+      return {
+        id: id,
+        brand_id: brandId,
+        category_id: categoryId,
+        sub_category_id: subcategoryId,
+      };
     });
+    console.log(brands);
+    const createdBrand = await brandcategory.bulkCreate(brands);
+    res.json({ message: "Products created successfully", createdBrand });
   } catch (err) {
-    console.error("uploadBulkDataBrandcategory:", err.message);
-    return res.status(err.status || 500).json({ error: err.status ? err.message : "Internal server error" });
+    res.status(404).json({ error: err.message });
   }
 };

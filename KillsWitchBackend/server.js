@@ -67,11 +67,18 @@ app.use(
     origin: (origin, cb) => {
       if (!origin) return cb(null, true); // Allow server-to-server
       if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-      cb(new Error(`CORS: origin ${origin} not allowed`));
+      console.warn(`CORS blocked origin: ${origin}`);
+      cb(null, false); // Reject without error to allow OPTIONS to pass
     },
     credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    optionsSuccessStatus: 200,
   })
 );
+
+// ── Explicit CORS Preflight Handling ──────────────────────────────────────────
+app.options("*", cors());
 
 // ── Rate Limiting ─────────────────────────────────────────────────────────────
 const globalLimiter = rateLimit({

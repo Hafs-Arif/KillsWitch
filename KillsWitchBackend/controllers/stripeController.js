@@ -1,287 +1,350 @@
-"use strict";
-
+// Load environment variables first
 require("dotenv").config();
 
-const Stripe  = require("stripe");
-const bcrypt  = require("bcrypt");
-const crypto  = require("crypto");
-
-const { query, transaction } = require("../config/db");
-const { sendEmail }          = require("../utils/email");
+const Stripe = require("stripe");
+const { Order, OrderItem, User } = require("../models");
+const { sendEmail } = require("../utils/email");
 const { orderConfirmationTemplate } = require("../utils/emailTemplates");
 
-// ── Stripe init ───────────────────────────────────────────────────────────────
-
+// Initialize Stripe with proper error handling
 if (!process.env.STRIPE_SECRET_KEY) {
   throw new Error("STRIPE_SECRET_KEY is not set in environment variables");
 }
-const stripe        = Stripe(process.env.STRIPE_SECRET_KEY);
-const STRIPE_MODE   = process.env.STRIPE_SECRET_KEY.startsWith("sk_test_") ? "test"
-                    : process.env.STRIPE_SECRET_KEY.startsWith("sk_live_") ? "live"
-                    : "unknown";
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+const STRIPE_KEY_MODE = process.env.STRIPE_SECRET_KEY.startsWith('sk_test_') ? 'test' : (process.env.STRIPE_SECRET_KEY.startsWith('sk_live_') ? 'live' : 'unknown');
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-const validEmail = (e) =>
-  typeof e === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
-
-function generateOrderId() {
-  return `ORD-${Date.now()}-${crypto.randomInt(100, 999)}`;
-}
-
-function generateTrackingNumber() {
-  return `TRK${Date.now().toString().slice(-8)}`;
-}
-
-// ── Create Payment Intent ─────────────────────────────────────────────────────
-
+/**
+ * Create a payment intent for Stripe
+ */
 exports.createPaymentIntent = async (req, res) => {
   try {
-    if (!req.user?.id) {
+    // Verify user is authenticated (auth middleware sets req.user)
+    if (!req.user || !req.user.id) {
       return res.status(401).json({ error: "Authentication required" });
     }
 
     const { amount, currency = "usd", metadata = {} } = req.body;
 
-    if (!amount || typeof amount !== "number" || amount <= 0) {
-      return res.status(400).json({ error: "Valid positive amount is required" });
+    // Validate amount
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ error: "Valid amount is required" });
     }
 
+    // Add user information to metadata for tracking
+    const enhancedMetadata = {
+      ...metadata,
+      userId: req.user.id.toString(),
+      userEmail: req.user.email,
+    };
+
+    // Create payment intent (CardElement flow)
     const paymentIntent = await stripe.paymentIntents.create({
-      amount:               Math.round(amount * 100),
+      amount: Math.round(amount * 100), // Convert to cents
       currency,
+      metadata: enhancedMetadata,
       payment_method_types: ["card"],
-      receipt_email:        req.user.email || undefined,
-      metadata: {
-        ...metadata,
-        userId:    String(req.user.id),
-        userEmail: req.user.email,
-      },
+      receipt_email: req.user?.email || undefined,
     });
 
-    console.log(`[Stripe][createPaymentIntent] mode=${STRIPE_MODE} id=${paymentIntent.id} amount=${amount}`);
+    console.log(`[Stripe][createPaymentIntent] mode=${STRIPE_KEY_MODE} id=${paymentIntent.id} amount=${amount} user=${req.user.email}`);
+    console.log(`[Stripe][createPaymentIntent] Using Stripe key: ${process.env.STRIPE_SECRET_KEY?.substring(0, 12)}...`);
+    console.log(`[Stripe][createPaymentIntent] Payment intent created successfully:`, {
+      id: paymentIntent.id,
+      status: paymentIntent.status,
+      amount: paymentIntent.amount,
+      currency: paymentIntent.currency,
+      client_secret: paymentIntent.client_secret?.substring(0, 20) + '...'
+    });
 
-    return res.json({
-      clientSecret:    paymentIntent.client_secret,
+    res.json({
+      clientSecret: paymentIntent.client_secret,
       paymentIntentId: paymentIntent.id,
     });
-  } catch (err) {
-    console.error("createPaymentIntent:", err.message);
-    return res.status(500).json({ error: "Failed to create payment intent" });
+  } catch (error) {
+    console.error("Error creating payment intent:", error);
+    res.status(500).json({ error: "Failed to create payment intent" });
   }
 };
 
-// ── Process Checkout ──────────────────────────────────────────────────────────
-
+/**
+ * Process checkout with Stripe payment
+ */
 exports.processCheckout = async (req, res) => {
   try {
     const {
-      email, password, phoneNumber, firstName, amount,
-      paymentIntentId, clientSecret,
-      shippingName, shippingMethod, shippingCompany, shippingPhone,
-      shippingAddress, shippingCity, shippingState, shippingCountry,
-      billingName, billingCompany, billingPhone,
-      billingAddress, billingCity, billingState, billingCountry,
+      email,
+      password,
+      phoneNumber,
+      firstName,
+      amount,
+      paymentIntentId,
+      clientSecret,
+      shippingName,
+      shippingMethod,
+      shippingCompany,
+      shippingPhone,
+      shippingAddress,
+      shippingCity,
+      shippingState,
+      shippingCountry,
+      billingName,
+      billingCompany,
+      billingPhone,
+      billingAddress,
+      billingCity,
+      billingState,
+      billingCountry,
       orderDetails,
     } = req.body;
 
-    // ── Required field validation ───────────────────────────
-    if (!validEmail(email))   return res.status(400).json({ error: "Valid email is required" });
-    if (!amount || amount <= 0) return res.status(400).json({ error: "Valid amount is required" });
-    if (!paymentIntentId)     return res.status(400).json({ error: "Payment intent ID is required" });
-    if (!shippingName?.trim()) return res.status(400).json({ error: "Shipping name is required" });
-    if (!shippingAddress?.trim()) return res.status(400).json({ error: "Shipping address is required" });
-    if (!orderDetails?.items?.length) return res.status(400).json({ error: "Order items are required" });
+    // Validate required fields
+    if (
+      !email ||
+      !amount ||
+      !paymentIntentId ||
+      !shippingName ||
+      !shippingAddress
+    ) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
 
-    const normalizedEmail = email.toLowerCase().trim();
-
-    // ── Verify payment with Stripe ──────────────────────────
+    console.log(`[Stripe][processCheckout] mode=${STRIPE_KEY_MODE} received paymentIntentId=${paymentIntentId}`);
+    console.log(`[Stripe][processCheckout] Stripe key mode: ${STRIPE_KEY_MODE}`);
+    console.log(`[Stripe][processCheckout] Using Stripe key: ${process.env.STRIPE_SECRET_KEY?.substring(0, 12)}...`);
+    
+    // Verify payment intent with Stripe
     let paymentIntent;
     try {
+      console.log(`[Stripe][processCheckout] Attempting to retrieve payment intent: ${paymentIntentId}`);
       paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+      console.log(`[Stripe][processCheckout] Successfully retrieved payment intent: ${paymentIntent.id}, status: ${paymentIntent.status}`);
     } catch (e) {
-      // Fallback: derive ID from clientSecret (format: pi_xxx_secret_xxx)
-      if (clientSecret && typeof clientSecret === "string" && clientSecret.startsWith("pi_")) {
-        const derivedId = clientSecret.split("_secret")[0];
+      console.error("Stripe retrieve payment intent failed:", e?.message || e);
+      console.error("Stripe error details:", {
+        type: e?.type,
+        code: e?.code,
+        param: e?.param,
+        message: e?.message
+      });
+      
+      // Fallback: derive ID from clientSecret if provided (format: pi_xxx_secret_xxx)
+      if (clientSecret && typeof clientSecret === 'string' && clientSecret.startsWith('pi_')) {
+        const derivedId = clientSecret.split('_secret')[0];
+        console.warn(`[Stripe][processCheckout] Falling back to derived PaymentIntent id from clientSecret: ${derivedId}`);
         try {
           paymentIntent = await stripe.paymentIntents.retrieve(derivedId);
+          console.log(`[Stripe][processCheckout] Successfully retrieved payment intent via fallback: ${paymentIntent.id}`);
         } catch (e2) {
-          console.error("Stripe retrieve (fallback) failed:", e2.message);
-          return res.status(400).json({ error: "Invalid payment intent" });
+          console.error("Stripe retrieve (fallback) payment intent failed:", e2?.message || e2);
+          return res.status(400).json({ 
+            error: `Invalid payment intent (fallback): ${e2?.message || 'unknown error'}`,
+            details: {
+              originalError: e?.message,
+              fallbackError: e2?.message,
+              paymentIntentId,
+              derivedId,
+              stripeMode: STRIPE_KEY_MODE
+            }
+          });
         }
       } else {
-        console.error("Stripe retrieve failed:", e.message);
-        return res.status(400).json({ error: "Invalid payment intent" });
+        return res.status(400).json({ 
+          error: `Invalid payment intent: ${e?.message || 'unknown error'}`,
+          details: {
+            error: e?.message,
+            paymentIntentId,
+            stripeMode: STRIPE_KEY_MODE,
+            hasClientSecret: !!clientSecret
+          }
+        });
       }
     }
 
+    console.log(`[Stripe][processCheckout] Payment intent status: ${paymentIntent.status}`);
+    
     if (paymentIntent.status !== "succeeded") {
-      return res.status(400).json({
-        error: `Payment not completed. Status: ${paymentIntent.status}`,
+      console.warn(`[Stripe][processCheckout] Payment intent status is ${paymentIntent.status}, not succeeded`);
+      console.warn(`[Stripe][processCheckout] Payment intent details:`, {
+        id: paymentIntent.id,
+        status: paymentIntent.status,
+        amount: paymentIntent.amount,
+        currency: paymentIntent.currency,
+        last_payment_error: paymentIntent.last_payment_error,
+        charges: paymentIntent.charges?.data?.length || 0
+      });
+      
+      return res.status(400).json({ 
+        error: `Payment not completed. Status: ${paymentIntent.status}`, 
+        details: {
+          status: paymentIntent.status,
+          paymentIntentId: paymentIntent.id,
+          message: paymentIntent.last_payment_error?.message || "Payment was not completed successfully"
+        }
       });
     }
 
-    // ── Find or create user ─────────────────────────────────
-    let userId = null;
-    const { rows: existingUsers } = await query(
-      `SELECT id FROM users WHERE email = $1`,
-      [normalizedEmail]
-    );
+    // Check if user exists or create new user
+    let user = null;
+    if (email) {
+      user = await User.findOne({ where: { email } });
 
-    if (existingUsers.length) {
-      userId = existingUsers[0].id;
-    } else {
-      const rawPass   = password?.trim() || crypto.randomBytes(9).toString("base64");
-      const hashedPwd = await bcrypt.hash(rawPass, 12);
+      if (!user) {
+        const bcrypt = require("bcrypt");
+        // Use provided password OR generate a random temp password for guest checkout
+        const rawPass =
+          (password && password.trim()) ||
+          Math.random().toString(36).slice(-12);
+        const hashedPassword = await bcrypt.hash(rawPass, 10);
 
-      const { rows: newUser } = await query(
-        `INSERT INTO users (email, password, name, phoneno, role, is_google_auth, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'user', false, NOW(), NOW())
-         RETURNING id`,
-        [normalizedEmail, hashedPwd, firstName || shippingName || "Guest", phoneNumber || null]
-      );
-      userId = newUser[0].id;
+        user = await User.create({
+          email,
+          password: hashedPassword,
+          name: firstName || shippingName || "Guest",
+          phoneno: phoneNumber || null,
+        });
+      }
     }
 
-    // ── Create order + items in a transaction ───────────────
-    const orderId        = generateOrderId();
-    const trackingNumber = generateTrackingNumber();
+    // Generate order ID
+    const orderId = `ORD-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const trackingNumber = `TRK${Date.now().toString().slice(-8)}`;
 
-    const orderRow = await transaction(async (tx) => {
-      const { rows: orderRows } = await tx(
-        `INSERT INTO orders (
-           order_id, user_id, email, amount, payment_intent_id,
-           payment_status, order_status, tracking_number,
-           shipping_name, shipping_method, shipping_company, shipping_phone,
-           shipping_address, shipping_city, shipping_state, shipping_country,
-           billing_name, billing_company, billing_phone,
-           billing_address, billing_city, billing_state, billing_country,
-           subtotal, shipping_cost, tax, total_price, is_full_cart,
-           created_at, updated_at
-         ) VALUES (
-           $1,$2,$3,$4,$5,
-           'completed','processing',$6,
-           $7,$8,$9,$10,
-           $11,$12,$13,$14,
-           $15,$16,$17,
-           $18,$19,$20,$21,
-           $22,$23,$24,$25,$26,
-           NOW(), NOW()
-         ) RETURNING *`,
-        [
-          orderId, userId, normalizedEmail, parseFloat(amount), paymentIntentId,
-          trackingNumber,
-          shippingName, shippingMethod || "standard", shippingCompany || null, shippingPhone || null,
-          shippingAddress, shippingCity || null, shippingState || null, shippingCountry || null,
-          billingName || shippingName, billingCompany || null, billingPhone || shippingPhone || null,
-          billingAddress || shippingAddress, billingCity || shippingCity || null,
-          billingState || shippingState || null, billingCountry || shippingCountry || null,
-          parseFloat(orderDetails.subtotal), parseFloat(orderDetails.shipping),
-          parseFloat(orderDetails.tax), parseFloat(orderDetails.total),
-          orderDetails.isFullCart || false,
-        ]
-      );
+    // Create order record
+    const order = await Order.create({
+      orderId,
+      userId: user ? user.id : null,
+      email,
+      amount: parseFloat(amount),
+      paymentIntentId,
+      paymentStatus: "completed",
+      order_status: "processing", // Fixed field name
+      trackingNumber,
 
-      const order = orderRows[0];
+      // Shipping information
+      shippingName,
+      shippingMethod: shippingMethod || "standard",
+      shippingCompany,
+      shippingPhone,
+      shippingAddress,
+      shippingCity,
+      shippingState,
+      shippingCountry,
 
-      // Build bulk insert for order items
-      if (orderDetails.items.length > 0) {
-        const valuePlaceholders = [];
-        const itemVals = [];
-        let idx = 1;
+      // Billing information
+      billingName: billingName || shippingName,
+      billingCompany,
+      billingPhone: billingPhone || shippingPhone,
+      billingAddress: billingAddress || shippingAddress,
+      billingCity: billingCity || shippingCity,
+      billingState: billingState || shippingState,
+      billingCountry: billingCountry || shippingCountry,
 
-        for (const item of orderDetails.items) {
-          valuePlaceholders.push(
-            `($${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, NOW(), NOW())`
-          );
-          itemVals.push(
-            order.order_id,
-            item.id,
-            item.name || "Item",
-            parseFloat(item.price) || 0,
-            parseInt(item.quantity, 10) || 1,
-            item.condition || "USED"
-          );
-        }
-
-        await tx(
-          `INSERT INTO order_items
-             (order_id, product_id, product_name, price, quantity, condition, created_at, updated_at)
-           VALUES ${valuePlaceholders.join(", ")}`,
-          itemVals
-        );
-      }
-
-      return order;
+      // Order details
+      subtotal: parseFloat(orderDetails.subtotal),
+      shipping_cost: parseFloat(orderDetails.shipping), // Fixed field name
+      tax: parseFloat(orderDetails.tax),
+      total_price: parseFloat(orderDetails.total), // Fixed field name
+      isFullCart: orderDetails.isFullCart || false,
     });
 
-    // ── Confirmation email (non-blocking) ───────────────────
+    // Create order items
+    if (orderDetails.items && orderDetails.items.length > 0) {
+      const orderItems = orderDetails.items.map((item) => ({
+        orderId: order.order_id, // Use the primary key from the created order
+        productId: item.id,
+        productName: item.name,
+        price: parseFloat(item.price),
+        quantity: item.quantity || 1,
+        condition: item.condition || "USED",
+      }));
+
+      await OrderItem.bulkCreate(orderItems);
+    }
+
+    // Send order confirmation email (non-blocking)
     try {
-      const from = process.env.SMTP_FROM || process.env.EMAIL_FROM || process.env.email_user;
-      const itemsForEmail = (orderDetails.items || []).map((it) => ({
-        name:     it.name || "Item",
+      const fromAddress =
+        process.env.SMTP_FROM ||
+        process.env.EMAIL_FROM ||
+        process.env.email_from ||
+        process.env.SMTP_USER ||
+        process.env.EMAIL_USER ||
+        process.env.email_user;
+
+      const itemsForEmail = (orderDetails?.items || []).map((it) => ({
+        name: it.name || it.productName || it.item || "Item",
         quantity: it.quantity || 1,
-        price:    parseFloat(it.price) || 0,
+        price: parseFloat(it.price) || 0,
       }));
 
       const { subject, html } = orderConfirmationTemplate({
-        order: orderRow,
+        order,
         items: itemsForEmail,
         currencyCode: "USD",
         appName: "Killswitch",
       });
 
-      sendEmail(from, normalizedEmail, subject, html)
-        .catch((err) => console.error("Order confirmation email failed:", err.message));
+      // Fire and forget; don't block checkout response on email
+      sendEmail(fromAddress, email, subject, html).catch((err) =>
+        console.error("Order confirmation email failed:", err.message)
+      );
     } catch (mailErr) {
-      console.error("Error preparing order email:", mailErr.message);
+      console.error("Error preparing order confirmation email:", mailErr);
     }
 
-    return res.json({
+    res.json({
       success: true,
       message: "Order processed successfully",
-      orderId:        orderRow.order_id,
-      trackingNumber: orderRow.tracking_number,
+      orderId: order.orderId,
+      trackingNumber: order.trackingNumber,
       paymentIntentId: paymentIntent.id,
       order: {
-        id:             orderRow.order_id,
-        status:         orderRow.order_status,
-        total:          orderRow.total_price,
-        trackingNumber: orderRow.tracking_number,
+        id: order.orderId,
+        status: order.order_status, // Fixed field name
+        total: order.total_price, // Fixed field name
+        trackingNumber: order.trackingNumber,
       },
     });
-  } catch (err) {
-    console.error("processCheckout:", err.message);
-    return res.status(500).json({ error: "Failed to process checkout" });
+  } catch (error) {
+    console.error("Error processing checkout:", error);
+    console.error("Error details:", {
+      message: error.message,
+      stack: error.stack,
+      requestBody: req.body,
+    });
+    res.status(500).json({
+      error: "Failed to process checkout",
+      details: error.message,
+    });
   }
 };
 
-// ── Get Publishable Key ───────────────────────────────────────────────────────
-
-exports.getPublishableKey = async (_req, res) => {
+/**
+ * Get Stripe publishable key
+ */
+exports.getPublishableKey = async (req, res) => {
   try {
-    const publishableKey = process.env.STRIPE_PUBLISHABLE_KEY;
-    if (!publishableKey) {
-      return res.status(500).json({ error: "Stripe publishable key not configured" });
-    }
-    return res.json({ publishableKey });
-  } catch (err) {
-    console.error("getPublishableKey:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    const publishableKey =
+      process.env.STRIPE_PUBLISHABLE_KEY ||
+      "pk_live_51S8kWHLP2FlHJkxxVebexLnCZNPu0V2ueJFAvtVLrCGP8S43BQSm1cZo8M89CBgDLFAyXo4y54HKjEQuCC6GF3RM00FZhf0Ozv";
+    res.json({
+      publishableKey: publishableKey,
+    });
+  } catch (error) {
+    console.error("Error getting publishable key:", error);
+    res.status(500).json({ error: "Failed to get publishable key" });
   }
 };
 
-// ── Webhook ───────────────────────────────────────────────────────────────────
-
+/**
+ * Handle Stripe webhooks
+ */
 exports.handleWebhook = async (req, res) => {
-  const sig            = req.headers["stripe-signature"];
+  const sig = req.headers["stripe-signature"];
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
-  if (!sig || !endpointSecret) {
-    return res.status(400).json({ error: "Missing webhook signature or secret" });
-  }
-
   let event;
+
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
   } catch (err) {
@@ -289,77 +352,82 @@ exports.handleWebhook = async (req, res) => {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
+  // Handle the event
   switch (event.type) {
-    case "payment_intent.succeeded": {
-      const pi = event.data.object;
-      console.log("Payment succeeded:", pi.id);
-      query(
-        `UPDATE orders SET payment_status = 'completed', updated_at = NOW()
-         WHERE payment_intent_id = $1`,
-        [pi.id]
-      ).catch((e) => console.error("Webhook order update failed:", e.message));
-      break;
-    }
+    case "payment_intent.succeeded":
+      const paymentIntent = event.data.object;
+      console.log("Payment succeeded:", paymentIntent.id);
 
-    case "payment_intent.payment_failed": {
-      const pi = event.data.object;
-      console.log("Payment failed:", pi.id);
-      query(
-        `UPDATE orders SET payment_status = 'failed', updated_at = NOW()
-         WHERE payment_intent_id = $1`,
-        [pi.id]
-      ).catch((e) => console.error("Webhook order update failed:", e.message));
+      // Update order status if needed
+      try {
+        await Order.update(
+          { paymentStatus: "completed" },
+          { where: { paymentIntentId: paymentIntent.id } }
+        );
+      } catch (error) {
+        console.error("Error updating order status:", error);
+      }
       break;
-    }
+
+    case "payment_intent.payment_failed":
+      const failedPayment = event.data.object;
+      console.log("Payment failed:", failedPayment.id);
+
+      // Update order status
+      try {
+        await Order.update(
+          { paymentStatus: "failed" },
+          { where: { paymentIntentId: failedPayment.id } }
+        );
+      } catch (error) {
+        console.error("Error updating failed payment status:", error);
+      }
+      break;
 
     default:
-      console.log(`Unhandled event type: ${event.type}`);
+      console.log(`Unhandled event type ${event.type}`);
   }
 
-  return res.json({ received: true });
+  res.json({ received: true });
 };
 
-// ── Refund ─────────────────────────────────────────────────────────────────────
-
+/**
+ * Refund a payment
+ */
 exports.refundPayment = async (req, res) => {
   try {
-    const { paymentIntentId, amount, reason = "requested_by_customer" } = req.body;
+    const {
+      paymentIntentId,
+      amount,
+      reason = "requested_by_customer",
+    } = req.body;
 
-    if (!paymentIntentId || typeof paymentIntentId !== "string") {
-      return res.status(400).json({ error: "Valid Payment Intent ID is required" });
-    }
-
-    const ALLOWED_REASONS = ["duplicate", "fraudulent", "requested_by_customer"];
-    if (!ALLOWED_REASONS.includes(reason)) {
-      return res.status(400).json({ error: "Invalid refund reason" });
-    }
-
-    if (amount !== undefined && (typeof amount !== "number" || amount <= 0)) {
-      return res.status(400).json({ error: "Refund amount must be a positive number" });
+    if (!paymentIntentId) {
+      return res.status(400).json({ error: "Payment Intent ID is required" });
     }
 
     const refund = await stripe.refunds.create({
       payment_intent: paymentIntentId,
-      amount: amount ? Math.round(amount * 100) : undefined,
-      reason,
+      amount: amount ? Math.round(amount * 100) : undefined, // Convert to cents or refund full amount
+      reason: reason,
     });
 
-    await query(
-      `UPDATE orders SET payment_status = 'refunded', updated_at = NOW()
-       WHERE payment_intent_id = $1`,
-      [paymentIntentId]
+    // Update order status
+    await Order.update(
+      { paymentStatus: "refunded" },
+      { where: { paymentIntentId } }
     );
 
-    return res.json({
+    res.json({
       success: true,
       refund: {
-        id:     refund.id,
-        amount: refund.amount / 100,
+        id: refund.id,
+        amount: refund.amount / 100, // Convert back to dollars
         status: refund.status,
       },
     });
-  } catch (err) {
-    console.error("refundPayment:", err.message);
-    return res.status(500).json({ error: "Failed to process refund" });
+  } catch (error) {
+    console.error("Error processing refund:", error);
+    res.status(500).json({ error: "Failed to process refund" });
   }
 };

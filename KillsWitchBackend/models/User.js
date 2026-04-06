@@ -1,37 +1,71 @@
-const { query } = require("../config/db");
+module.exports = (sequelize, DataTypes) => {
+  const User = sequelize.define("user", {
+    id: {
+      type: DataTypes.INTEGER,
+      primaryKey: true,
+      autoIncrement: true,
+    },
+    name: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    email: {
+      type: DataTypes.STRING,
+      unique: true,
+      allowNull: false,
+    },
+    googleId: {
+      type: DataTypes.STRING,
+      unique: true,
+      sparse: true,
+    },
+    isGoogleAuth: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+    phoneno: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    password: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    role: {
+      type: DataTypes.ENUM("admin", "user"),
+      defaultValue: "user",
+    },
+    refreshtoken: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+    sameShippingBillingDefault: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+  });
+  User.associate = (models) => {
+    User.hasMany(models.Contact, {
+      foreignKey: "userId",
+      as: "contacts",
+    });
 
-class UserModel {
-  static async create(name, email, password, role = "user", phoneno = null, googleId = null, isGoogleAuth = false) {
-    const { rows } = await query(
-      `INSERT INTO users (name, email, password, role, phoneno, google_id, is_google_auth, created_at, updated_at, same_shipping_billing_default)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW(), false)
-       RETURNING id, email, name, role`,
-      [name, email.toLowerCase(), password, role, phoneno, googleId, isGoogleAuth]
-    );
-    return rows[0];
-  }
+    User.hasMany(models.ActivityLog, {
+      foreignKey: "user_email", // maps to ActivityLog.user_email
+      sourceKey: "email", // maps to User.email
+      as: "activityLogs",
+    });
 
-  static async findByEmail(email) {
-    const { rows } = await query(`SELECT * FROM users WHERE email = $1`, [email.toLowerCase()]);
-    return rows[0] || null;
-  }
+    User.hasMany(models.Cart, {
+      foreignKey: "userId",
+      as: "carts",
+    });
 
-  static async findById(id) {
-    const { rows } = await query(`SELECT id, email, name, role, phoneno FROM users WHERE id = $1`, [id]);
-    return rows[0] || null;
-  }
+    User.hasMany(models.Address, {
+      foreignKey: "userId",
+      as: "addresses",
+    });
+  };
 
-  static async findByIdWithPassword(id) {
-    const { rows } = await query(`SELECT id, email, name, role, phoneno, password, google_id FROM users WHERE id = $1`, [id]);
-    return rows[0] || null;
-  }
-
-  static async updatePassword(email, hashedPassword) {
-    await query(
-      `UPDATE users SET password = $1, updated_at = NOW() WHERE email = $2`,
-      [hashedPassword, email.toLowerCase()]
-    );
-  }
-}
-
-module.exports = { UserModel };
+  return User;
+};

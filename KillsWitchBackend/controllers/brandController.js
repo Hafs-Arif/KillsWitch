@@ -1,425 +1,757 @@
-// controllers/brandController.js  –  raw SQL (pg)
-"use strict";
+// controller.js
+const { brand, category, subcategory, brandcategory, product } = require('../models');
+const { Op } = require('sequelize');
+const { sequelize } = require('../models'); // your Sequelize instance
 
-const { query, transaction } = require("../config/db");
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// READ / BROWSE  (public)
-// ═══════════════════════════════════════════════════════════════════════════════
 
 exports.getAllProductWithBrandAndCategory = async (req, res) => {
-  const { brandId, categoryId, subcategoryId } = req.query;
-  if (!brandId) return res.status(400).json({ error: "brandId is required" });
-
-  const bid = parseInt(brandId, 10);
-  if (isNaN(bid)) return res.status(400).json({ error: "Invalid brandId" });
-
-  try {
-    const params = [bid];
-    let catFilter = "";
-    let subFilter = "";
-
-    if (categoryId)   { catFilter = `AND c.product_category_id = $${params.push(parseInt(categoryId,   10))}`; }
-    if (subcategoryId){ subFilter = `AND sc.sub_category_id    = $${params.push(parseInt(subcategoryId, 10))}`; }
-
-    const { rows } = await query(
-      `SELECT
-         b.brand_id, b.brand_name,
-         c.product_category_id AS category_id, c.category_name,
-         sc.sub_category_id,  sc.sub_category_name,
-         p.product_id, p.part_number, p.price, p.image, p.condition, p.status
-       FROM brands b
-       JOIN brandcategory bc ON bc.brand_id            = b.brand_id     ${catFilter} ${subFilter}
-       JOIN categories    c  ON c.product_category_id  = bc.category_id
-       JOIN subcategories sc ON sc.sub_category_id     = bc.sub_category_id
-       LEFT JOIN products p  ON p.brandcategory_id     = bc.id
-       WHERE b.brand_id = $1
-       ORDER BY c.product_category_id, sc.sub_category_id, p.product_id`,
-      params
-    );
-
-    if (!rows.length) return res.status(404).json({ error: "No matching data found" });
-    return res.json(rows);
-  } catch (err) {
-    console.error("getAllProductWithBrandAndCategory:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-};
-
-exports.getPartName = async (_req, res) => {
-  try {
-    const { rows } = await query(
-      `SELECT
-         b.brand_id, b.brand_name,
-         c.product_category_id, c.category_name,
-         sc.sub_category_id, sc.sub_category_name,
-         p.product_id, p.part_number
-       FROM brands b
-       JOIN brandcategory bc ON bc.brand_id            = b.brand_id
-       JOIN categories    c  ON c.product_category_id  = bc.category_id
-       JOIN subcategories sc ON sc.sub_category_id     = bc.sub_category_id
-       LEFT JOIN products p  ON p.brandcategory_id     = bc.id
-       ORDER BY b.brand_id, c.product_category_id, sc.sub_category_id, p.product_id`
-    );
-
-    // Build nested structure in JS
-    const brandMap = new Map();
-    for (const r of rows) {
-      if (!brandMap.has(r.brand_id)) {
-        brandMap.set(r.brand_id, { brand_id: r.brand_id, brand_name: r.brand_name, categories: [] });
+    const { brandId, categoryId, subcategoryId } = req.query;
+  
+    try {
+      if (!brandId) {
+        return res.status(400).json({ error: 'brandId is required' });
       }
-      const brand = brandMap.get(r.brand_id);
-      let cat = brand.categories.find(c => c.category_id === r.product_category_id);
-      if (!cat) {
-        cat = { category_id: r.product_category_id, category_name: r.category_name, subcategories: [] };
-        brand.categories.push(cat);
+  
+      const brands = await brand.findAll({
+        attributes: ['brand_id', 'brand_name'],
+        where: { brand_id: brandId },
+        include: [
+          {
+            model: brandcategory,
+            as: 'brandcategory',
+            include: [
+              {
+                model: category,
+                as: 'category',
+                where: categoryId ? { product_category_id: categoryId } : undefined,
+                required: !!categoryId,
+              },
+              {
+                model: subcategory,
+                as: 'subcategory',
+                where: subcategoryId ? { sub_category_id: subcategoryId } : undefined,
+                required: !!subcategoryId,
+              },
+              {
+                model: product,
+                as: 'product',
+                required: false,
+              },
+            ],
+          },
+        ],
+      });
+  
+      if (!brands.length) {
+        return res.status(404).json({ error: 'No matching data found' });
       }
-      let sub = cat.subcategories.find(s => s.subcategory_id === r.sub_category_id);
-      if (!sub) {
-        sub = { subcategory_id: r.sub_category_id, subcategory_name: r.sub_category_name, products: [] };
-        cat.subcategories.push(sub);
-      }
-      if (r.product_id && !sub.products.find(p => p.product_id === r.product_id)) {
-        sub.products.push({ product_id: r.product_id, product_name: r.part_number });
-      }
+  
+      const response = brands.map((b) => {
+        const brandObj = {
+          brand_id: b.brand_id,
+          brand_name: b.brand_name,
+        };
+  
+        // If only brandId → return brand with all products (across all brandcategory entries)
+        if (!categoryId && !subcategoryId) {
+          const allProducts = b.brandcategory.flatMap((bc) => bc.product || []);
+          brandObj.products = allProducts.map((p) => ({
+            product_id: p.product_id,
+            part_number: p.part_number,
+          }));
+          return brandObj;
+        }
+  
+        // If brandId + categoryId (and optionally subcategoryId)
+        brandObj.categories = b.brandcategory.map((bc) => {
+          const categoryInfo = {
+            category_id: bc.category?.product_category_id,
+            category_name: bc.category?.category_name,
+          };
+  
+          if (subcategoryId) {
+            categoryInfo.subcategories = [
+              {
+                sub_category_id: bc.subcategory?.sub_category_id,
+                sub_category_name: bc.subcategory?.sub_category_name,
+                products: (bc.product || []).map((p) => ({
+                  product_id: p.product_id,
+                  part_number: p.part_number,
+                })),
+              },
+            ];
+          } else {
+            categoryInfo.products = (bc.product || []).map((p) => ({
+              product_id: p.product_id,
+              part_number: p.part_number,
+            }));
+          }
+  
+          return categoryInfo;
+        });
+  
+        return brandObj;
+      });
+  
+      res.json(response);
+    } catch (error) {
+      console.error('Error fetching data:', error);
+      res.status(500).json({ error: error.message });
     }
-    return res.json(Array.from(brandMap.values()));
-  } catch (err) {
-    console.error("getPartName:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
-  }
 };
 
+exports.getPartName = async (req, res) => {
+    try {
+      // Fetch flat joined data using Sequelize
+      const data = await brand.findAll({
+        attributes: ['brand_id', 'brand_name'],
+        include: [
+          {
+            model: brandcategory,
+            as: 'brandcategory',
+            attributes: ['id'],
+            include: [
+              {
+                model: category,
+                as: 'category',
+                attributes: ['product_category_id', 'category_name'],
+              },
+              {
+                model: subcategory,
+                as: 'subcategory',
+                attributes: ['sub_category_id', 'sub_category_name'],
+              },
+              {
+                model: product,
+                as: 'product',
+                attributes: ['product_id', 'part_number'],
+              },
+            ],
+          },
+        ],
+        order: [
+          ['brand_id', 'ASC'],
+          [{ model: brandcategory, as: 'brandcategory' }, { model: category, as: 'category' }, 'product_category_id', 'ASC'],
+          [{ model: brandcategory, as: 'brandcategory' }, { model: subcategory, as: 'subcategory' }, 'sub_category_id', 'ASC'],
+          [{ model: brandcategory, as: 'brandcategory' }, { model: product, as: 'product' }, 'product_id', 'ASC'],
+        ],
+      });
+  
+      if (!data.length) {
+        return res.status(404).json({ error: 'No brands found.' });
+      }
+  
+      // ✅ Transform to nested structure
+      const result = data.map((b) => {
+        const brandObj = {
+          brand_id: b.brand_id,
+          brand_name: b.brand_name,
+          categories: [],
+        };
+  
+        const categoryMap = new Map();
+  
+        b.brandcategory.forEach((bc) => {
+          const cat = bc.category;
+          const sub = bc.subcategory;
+          const prodList = bc.product || [];
+  
+          // Add null safety checks
+          if (!cat || !sub) return;
+  
+          if (!categoryMap.has(cat.product_category_id)) {
+            categoryMap.set(cat.product_category_id, {
+              category_id: cat.product_category_id,
+              category_name: cat.category_name,
+              subcategories: [],
+            });
+          }
+
+          const categoryEntry = categoryMap.get(cat.product_category_id);
+
+          let subcategoryEntry = categoryEntry.subcategories.find(s => s.subcategory_id === sub.sub_category_id);
+          if (!subcategoryEntry) {
+            subcategoryEntry = {
+              subcategory_id: sub.sub_category_id,
+              subcategory_name: sub.sub_category_name,
+              products: [],
+            };
+            categoryEntry.subcategories.push(subcategoryEntry);
+          }
+
+          prodList.forEach((p) => {
+            if (!subcategoryEntry.products.find(pr => pr.product_id === p.product_id)) {
+              subcategoryEntry.products.push({
+                product_id: p.product_id,
+                product_name: p.part_number,
+              });
+            }
+          });
+        });
+
+        brandObj.categories = Array.from(categoryMap.values());
+        return brandObj;
+      });
+  
+      res.json(result);
+    } catch (err) {
+      console.error('Error fetching part names:', err);
+      res.status(500).json({ error: err.message });
+    }
+};
 exports.getBrandsByCategory = async (req, res) => {
-  const { categoryName } = req.query;
-  if (!categoryName) return res.status(400).json({ error: "categoryName is required" });
+    try {
+      const { categoryName } = req.query;
+  
+      if (!categoryName) {
+        return res.status(400).json({ error: 'categoryName is required.' });
+      }
+  
+      // STEP 1: Get category IDs matching 'router' (case-insensitive)
+      const matchingCategories = await category.findAll({
+        where: {
+           // name: categoryName
+          category_name: {
+            [Op.iLike]: `%${categoryName}%`,
+          },
+        },
+        attributes: ['product_category_id'],
+      });
+  
+      const categoryIds = matchingCategories.map((cat) => cat.product_category_id);
+  
+      if (!categoryIds.length) {
+        return res.status(404).json({ error: 'No matching categories found.' });
+      }
+  
+      // STEP 2: Fetch brands with brandcategories matching those category IDs
+      const brands = await brand.findAll({
+        attributes: ['brand_id', 'brand_name'],
+        include: [
+          {
+            model: brandcategory,
+            as: 'brandcategory',
+            attributes: ['id'],
+            where: {
+              category_id: {
+                [Op.in]: categoryIds,
+              },
+            },
+            include: [
+              {
+                model: category,
+                as: 'category',
+                attributes: ['product_category_id', 'category_name'],
+              },
+              {
+                model: subcategory,
+                as: 'subcategory',
+                attributes: ['sub_category_id', 'sub_category_name'],
+                required: false,
+              },
+              {
+                model: product,
+                as: 'product',
+                attributes: [
+                  'product_id',
+                  'part_number',
+                  'price',
+                  'quantity',
+                  'short_description',
+                  'long_description',
+                  'image',
+                  'sub_condition',
+                  'condition',
+                ],
+                required: false,
+              },
+            ],
+          },
+        ],
+      });
+  
+      // STEP 3: Transform the response
+      const result = brands.map((b) => {
+        const brandObj = {
+          brand_id: b.brand_id,
+          brand_name: b.brand_name,
+          categories: [],
+        };
+  
+        const categoryMap = new Map();
+  
+        b.brandcategory.forEach((bc) => {
+          const cat = bc.category;
+          if (!cat) return;
+  
+          const sub = bc.subcategory;
+          const prodList = bc.product || [];
+  
+          if (!categoryMap.has(cat.product_category_id)) {
+            categoryMap.set(cat.product_category_id, {
+              category_id: cat.product_category_id,
+              category_name: cat.category_name,
+              subcategories: [],
+            });
+          }
+  
+          const categoryEntry = categoryMap.get(cat.product_category_id);
+  
+          if (sub) {
+            let subcategoryEntry = categoryEntry.subcategories.find(
+              (s) => s.subcategory_id === sub.sub_category_id
+            );
+  
+            if (!subcategoryEntry) {
+              subcategoryEntry = {
+                subcategory_id: sub.sub_category_id,
+                subcategory_name: sub.sub_category_name,
+                products: [],
+              };
+              categoryEntry.subcategories.push(subcategoryEntry);
+            }
+  
+            prodList.forEach((p) => {
+              subcategoryEntry.products.push({
+                product_id: p.product_id,
+                product_name: p.part_number,
+                price: p.price,
+                quantity: p.quantity,
+                short_des: p.short_description,
+                long_description: p.long_description,
+                product_image: p.image,
+                SubCondition: p.sub_condition,
+                condition: p.condition,
+              });
+            });
+          }
+        });
+  
+        brandObj.categories = Array.from(categoryMap.values());
+        return brandObj;
+      });
+  
+      res.json(result);
+    } catch (err) {
+      console.error('Error:', err);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+};
 
+exports.getAllCategoriesOfAllBrand = async (req, res) => {
   try {
-    const { rows } = await query(
-      `SELECT
-         b.brand_id, b.brand_name,
-         c.product_category_id, c.category_name,
-         sc.sub_category_id, sc.sub_category_name,
-         p.product_id, p.part_number, p.price, p.quantity,
-         p.short_description, p.long_description, p.image,
-         p.sub_condition, p.condition
-       FROM brands b
-       JOIN brandcategory bc ON bc.brand_id            = b.brand_id
-       JOIN categories    c  ON c.product_category_id  = bc.category_id  AND c.category_name ILIKE $1
-       JOIN subcategories sc ON sc.sub_category_id     = bc.sub_category_id
-       LEFT JOIN products p  ON p.brandcategory_id     = bc.id
-       ORDER BY b.brand_id, c.product_category_id, sc.sub_category_id`,
-      [`%${categoryName}%`]
+    const results = await sequelize.query(
+      `
+      SELECT
+        b.brand_id,
+        b.brand_name,
+        JSON_AGG(DISTINCT c.category_name) AS categories
+      FROM
+        brands b
+      LEFT JOIN brandcategory bc ON bc."brand_id" = b.brand_id
+      LEFT JOIN categories c ON bc."category_id" = c.product_category_id
+      LEFT JOIN subcategories s ON bc."sub_category_id" = s.sub_category_id
+      GROUP BY b.brand_id, b.brand_name
+      ORDER BY b.brand_id ASC
+      `,
+      {
+        type: sequelize.QueryTypes.SELECT,
+      }
     );
 
-    if (!rows.length) return res.status(404).json({ error: "No matching categories found" });
-    return res.json(rows);
-  } catch (err) {
-    console.error("getBrandsByCategory:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    res.json(results);
+  } catch (error) {
+    console.error('Error fetching brand categories:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
   }
 };
 
-exports.getAllCategoriesOfAllBrand = async (_req, res) => {
+// CRUD Operations for Brands
+exports.getAllBrands = async (req, res) => {
   try {
-    const { rows } = await query(
-      `SELECT b.brand_id, b.brand_name,
-              JSON_AGG(DISTINCT c.category_name) AS categories
-       FROM brands b
-       LEFT JOIN brandcategory bc ON bc.brand_id            = b.brand_id
-       LEFT JOIN categories    c  ON c.product_category_id  = bc.category_id
-       GROUP BY b.brand_id, b.brand_name
-       ORDER BY b.brand_id`
-    );
-    return res.json(rows);
-  } catch (err) {
-    console.error("getAllCategoriesOfAllBrand:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-};
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// BRANDS CRUD  (admin)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-exports.getAllBrands = async (_req, res) => {
-  try {
-    const { rows } = await query("SELECT brand_id, brand_name FROM brands ORDER BY brand_id");
-    return res.json(rows);
-  } catch (err) {
-    console.error("getAllBrands:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    const brands = await brand.findAll({
+      attributes: ['brand_id', 'brand_name'],
+      order: [['brand_id', 'ASC']]
+    });
+    res.json(brands);
+  } catch (error) {
+    console.error('Error fetching brands:', error);
+    res.status(500).json({ error: error.message });
   }
 };
 
 exports.createBrand = async (req, res) => {
-  const { brand_name, brand_id } = req.body;
-  if (!brand_name || !brand_id) return res.status(400).json({ error: "brand_name and brand_id are required" });
-
   try {
-    const { rowCount } = await query("SELECT 1 FROM brands WHERE brand_id = $1", [brand_id]);
-    if (rowCount) return res.status(409).json({ error: "Brand ID already exists" });
+    const { brand_name, brand_id } = req.body;
+    
+    if (!brand_name || !brand_id) {
+      return res.status(400).json({ error: 'Brand name and ID are required' });
+    }
 
-    const { rows } = await query(
-      "INSERT INTO brands (brand_id, brand_name) VALUES ($1, $2) RETURNING *",
-      [parseInt(brand_id, 10), brand_name.trim()]
-    );
-    return res.status(201).json({ message: "Brand created", brand: rows[0] });
-  } catch (err) {
-    console.error("createBrand:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    // Check if brand already exists
+    const existingBrand = await brand.findOne({ where: { brand_id } });
+    if (existingBrand) {
+      return res.status(409).json({ error: 'Brand with this ID already exists' });
+    }
+
+    const newBrand = await brand.create({ 
+      brand_name, 
+      brand_id
+    });
+
+    res.status(201).json({
+      message: 'Brand created successfully',
+      brand: newBrand
+    });
+  } catch (error) {
+    console.error('Error creating brand:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 };
 
 exports.updateBrand = async (req, res) => {
-  const id = parseInt(req.params.id, 10);
-  const { brand_name } = req.body;
-  if (!brand_name) return res.status(400).json({ error: "brand_name is required" });
-
   try {
-    const { rows } = await query(
-      "UPDATE brands SET brand_name = $1 WHERE brand_id = $2 RETURNING *",
-      [brand_name.trim(), id]
-    );
-    if (!rows.length) return res.status(404).json({ error: "Brand not found" });
-    return res.json({ message: "Brand updated", brand: rows[0] });
-  } catch (err) {
-    console.error("updateBrand:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    const { id } = req.params;
+    const { brand_name } = req.body;
+
+    if (!brand_name) {
+      return res.status(400).json({ error: 'Brand name is required' });
+    }
+
+    const existingBrand = await brand.findByPk(id);
+    if (!existingBrand) {
+      return res.status(404).json({ error: 'Brand not found' });
+    }
+
+    await existingBrand.update({ brand_name });
+
+    res.json({
+      message: 'Brand updated successfully',
+      brand: existingBrand
+    });
+  } catch (error) {
+    console.error('Error updating brand:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 };
 
 exports.deleteBrand = async (req, res) => {
-  const id = parseInt(req.params.id, 10);
   try {
-    const { rowCount: inUse } = await query(
-      "SELECT 1 FROM brandcategory WHERE brand_id = $1 LIMIT 1", [id]
-    );
-    if (inUse) return res.status(400).json({ error: "Brand is in use; remove its category links first" });
+    const { id } = req.params;
 
-    const { rowCount } = await query("DELETE FROM brands WHERE brand_id = $1", [id]);
-    if (!rowCount) return res.status(404).json({ error: "Brand not found" });
-    return res.json({ message: "Brand deleted" });
-  } catch (err) {
-    console.error("deleteBrand:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    const brandToDelete = await brand.findByPk(id);
+    if (!brandToDelete) {
+      return res.status(404).json({ error: 'Brand not found' });
+    }
+
+    // Check if brand is being used in brandcategory
+    const brandCategoryCount = await brandcategory.count({
+      where: { brand_id: id }
+    });
+
+    if (brandCategoryCount > 0) {
+      return res.status(400).json({ 
+        error: 'Cannot delete brand. It is being used in brand-category relationships.' 
+      });
+    }
+
+    await brandToDelete.destroy();
+
+    res.json({
+      message: 'Brand deleted successfully'
+    });
+  } catch (error) {
+    console.error('Error deleting brand:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// CATEGORIES CRUD  (admin)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-exports.getAllCategories = async (_req, res) => {
+// CRUD Operations for Categories
+exports.getAllCategories = async (req, res) => {
   try {
-    const { rows } = await query("SELECT * FROM categories ORDER BY product_category_id");
-    return res.json(rows);
-  } catch (err) {
-    console.error("getAllCategories:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    const categories = await category.findAll({
+      order: [['product_category_id', 'ASC']]
+    });
+    res.json(categories);
+  } catch (error) {
+    console.error('Error fetching categories:', error);
+    res.status(500).json({ error: error.message });
   }
 };
 
 exports.createCategory = async (req, res) => {
-  const { category_name, product_category_id } = req.body;
-  if (!category_name || !product_category_id)
-    return res.status(400).json({ error: "category_name and product_category_id are required" });
-
   try {
-    const { rowCount } = await query(
-      "SELECT 1 FROM categories WHERE product_category_id = $1", [product_category_id]
-    );
-    if (rowCount) return res.status(409).json({ error: "Category ID already exists" });
+    const { category_name, product_category_id } = req.body;
+    
+    if (!category_name || !product_category_id) {
+      return res.status(400).json({ error: 'Category name and ID are required' });
+    }
 
-    const { rows } = await query(
-      "INSERT INTO categories (product_category_id, category_name) VALUES ($1,$2) RETURNING *",
-      [parseInt(product_category_id, 10), category_name.trim()]
-    );
-    return res.status(201).json({ message: "Category created", category: rows[0] });
-  } catch (err) {
-    console.error("createCategory:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    // Check if category already exists
+    const existingCategory = await category.findOne({ where: { product_category_id } });
+    if (existingCategory) {
+      return res.status(409).json({ error: 'Category with this ID already exists' });
+    }
+
+    const newCategory = await category.create({ category_name, product_category_id });
+    res.status(201).json({ message: 'Category created successfully', category: newCategory });
+  } catch (error) {
+    console.error('Error creating category:', error);
+    res.status(500).json({ error: error.message });
   }
 };
 
 exports.updateCategory = async (req, res) => {
-  const id = parseInt(req.params.id, 10);
-  const { category_name } = req.body;
-  if (!category_name) return res.status(400).json({ error: "category_name is required" });
-
   try {
-    const { rows } = await query(
-      "UPDATE categories SET category_name=$1 WHERE product_category_id=$2 RETURNING *",
-      [category_name.trim(), id]
-    );
-    if (!rows.length) return res.status(404).json({ error: "Category not found" });
-    return res.json({ message: "Category updated", category: rows[0] });
-  } catch (err) {
-    console.error("updateCategory:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    const { id } = req.params;
+    const { category_name } = req.body;
+
+    if (!category_name) {
+      return res.status(400).json({ error: 'Category name is required' });
+    }
+
+    const categoryToUpdate = await category.findByPk(id);
+    if (!categoryToUpdate) {
+      return res.status(404).json({ error: 'Category not found' });
+    }
+
+    await categoryToUpdate.update({ category_name });
+    res.json({ message: 'Category updated successfully', category: categoryToUpdate });
+  } catch (error) {
+    console.error('Error updating category:', error);
+    res.status(500).json({ error: error.message });
   }
 };
 
 exports.deleteCategory = async (req, res) => {
-  const id = parseInt(req.params.id, 10);
   try {
-    const { rowCount } = await query("DELETE FROM categories WHERE product_category_id=$1", [id]);
-    if (!rowCount) return res.status(404).json({ error: "Category not found" });
-    return res.json({ message: "Category deleted" });
-  } catch (err) {
-    console.error("deleteCategory:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    const { id } = req.params;
+
+    const categoryToDelete = await category.findByPk(id);
+    if (!categoryToDelete) {
+      return res.status(404).json({ error: 'Category not found' });
+    }
+
+    await categoryToDelete.destroy();
+    res.json({ message: 'Category deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting category:', error);
+    res.status(500).json({ error: error.message });
   }
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SUBCATEGORIES CRUD  (admin)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-exports.getAllSubcategories = async (_req, res) => {
+// CRUD Operations for Subcategories
+exports.getAllSubcategories = async (req, res) => {
   try {
-    const { rows } = await query("SELECT * FROM subcategories ORDER BY sub_category_id");
-    return res.json(rows);
-  } catch (err) {
-    console.error("getAllSubcategories:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    const subcategories = await subcategory.findAll({
+      order: [['sub_category_id', 'ASC']]
+    });
+    res.json(subcategories);
+  } catch (error) {
+    console.error('Error fetching subcategories:', error);
+    res.status(500).json({ error: error.message });
   }
 };
 
 exports.createSubcategory = async (req, res) => {
-  const { sub_category_name, sub_category_id } = req.body;
-  if (!sub_category_name || !sub_category_id)
-    return res.status(400).json({ error: "sub_category_name and sub_category_id are required" });
-
   try {
-    const { rowCount } = await query(
-      "SELECT 1 FROM subcategories WHERE sub_category_id = $1", [sub_category_id]
-    );
-    if (rowCount) return res.status(409).json({ error: "Subcategory ID already exists" });
+    const { sub_category_name, sub_category_id } = req.body;
+    
+    if (!sub_category_name || !sub_category_id) {
+      return res.status(400).json({ error: 'Subcategory name and ID are required' });
+    }
 
-    const { rows } = await query(
-      "INSERT INTO subcategories (sub_category_id, sub_category_name) VALUES ($1,$2) RETURNING *",
-      [parseInt(sub_category_id, 10), sub_category_name.trim()]
-    );
-    return res.status(201).json({ message: "Subcategory created", subcategory: rows[0] });
-  } catch (err) {
-    console.error("createSubcategory:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    // Check if subcategory already exists
+    const existingSubcategory = await subcategory.findOne({ where: { sub_category_id } });
+    if (existingSubcategory) {
+      return res.status(409).json({ error: 'Subcategory with this ID already exists' });
+    }
+
+    const newSubcategory = await subcategory.create({ sub_category_name, sub_category_id });
+    res.status(201).json({ message: 'Subcategory created successfully', subcategory: newSubcategory });
+  } catch (error) {
+    console.error('Error creating subcategory:', error);
+    res.status(500).json({ error: error.message });
   }
 };
 
 exports.updateSubcategory = async (req, res) => {
-  const id = parseInt(req.params.id, 10);
-  const { sub_category_name } = req.body;
-  if (!sub_category_name) return res.status(400).json({ error: "sub_category_name is required" });
-
   try {
-    const { rows } = await query(
-      "UPDATE subcategories SET sub_category_name=$1 WHERE sub_category_id=$2 RETURNING *",
-      [sub_category_name.trim(), id]
-    );
-    if (!rows.length) return res.status(404).json({ error: "Subcategory not found" });
-    return res.json({ message: "Subcategory updated", subcategory: rows[0] });
-  } catch (err) {
-    console.error("updateSubcategory:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    const { id } = req.params;
+    const { sub_category_name } = req.body;
+
+    if (!sub_category_name) {
+      return res.status(400).json({ error: 'Subcategory name is required' });
+    }
+
+    const subcategoryToUpdate = await subcategory.findByPk(id);
+    if (!subcategoryToUpdate) {
+      return res.status(404).json({ error: 'Subcategory not found' });
+    }
+
+    await subcategoryToUpdate.update({ sub_category_name });
+    res.json({ message: 'Subcategory updated successfully', subcategory: subcategoryToUpdate });
+  } catch (error) {
+    console.error('Error updating subcategory:', error);
+    res.status(500).json({ error: error.message });
   }
 };
 
 exports.deleteSubcategory = async (req, res) => {
-  const id = parseInt(req.params.id, 10);
   try {
-    const { rowCount } = await query("DELETE FROM subcategories WHERE sub_category_id=$1", [id]);
-    if (!rowCount) return res.status(404).json({ error: "Subcategory not found" });
-    return res.json({ message: "Subcategory deleted" });
-  } catch (err) {
-    console.error("deleteSubcategory:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    const { id } = req.params;
+
+    const subcategoryToDelete = await subcategory.findByPk(id);
+    if (!subcategoryToDelete) {
+      return res.status(404).json({ error: 'Subcategory not found' });
+    }
+
+    await subcategoryToDelete.destroy();
+    res.json({ message: 'Subcategory deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting subcategory:', error);
+    res.status(500).json({ error: error.message });
   }
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// BRAND-CATEGORY LINKS CRUD  (admin)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-exports.getAllBrandCategories = async (_req, res) => {
+// CRUD Operations for Brand Categories
+exports.getAllBrandCategories = async (req, res) => {
   try {
-    const { rows } = await query(
-      `SELECT bc.*,
-              b.brand_name,
-              c.category_name,
-              sc.sub_category_name
-       FROM brandcategory bc
-       JOIN brands        b  ON b.brand_id            = bc.brand_id
-       JOIN categories    c  ON c.product_category_id = bc.category_id
-       JOIN subcategories sc ON sc.sub_category_id    = bc.sub_category_id
-       ORDER BY bc.id`
-    );
-    return res.json(rows);
-  } catch (err) {
-    console.error("getAllBrandCategories:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    const brandCategories = await brandcategory.findAll({
+      include: [
+        {
+          model: brand,
+          as: 'brand',
+          attributes: ['brand_id', 'brand_name']
+        },
+        {
+          model: category,
+          as: 'category',
+          attributes: ['product_category_id', 'category_name']
+        },
+        {
+          model: subcategory,
+          as: 'subcategory',
+          attributes: ['sub_category_id', 'sub_category_name']
+        }
+      ],
+      order: [['id', 'ASC']]
+    });
+    res.json(brandCategories);
+  } catch (error) {
+    console.error('Error fetching brand categories:', error);
+    res.status(500).json({ error: error.message });
   }
 };
 
 exports.createBrandCategory = async (req, res) => {
-  const { id, brand_id, category_id, sub_category_id } = req.body;
-  if (!id || !brand_id || !category_id || !sub_category_id)
-    return res.status(400).json({ error: "id, brand_id, category_id, sub_category_id are required" });
-
   try {
-    // Verify referenced entities exist
-    const checks = await Promise.all([
-      query("SELECT 1 FROM brands        WHERE brand_id            = $1", [brand_id]),
-      query("SELECT 1 FROM categories    WHERE product_category_id = $1", [category_id]),
-      query("SELECT 1 FROM subcategories WHERE sub_category_id     = $1", [sub_category_id]),
-      query("SELECT 1 FROM brandcategory WHERE id                  = $1", [id]),
-    ]);
-    if (!checks[0].rowCount) return res.status(404).json({ error: "Brand not found" });
-    if (!checks[1].rowCount) return res.status(404).json({ error: "Category not found" });
-    if (!checks[2].rowCount) return res.status(404).json({ error: "Subcategory not found" });
-    if ( checks[3].rowCount) return res.status(409).json({ error: "Brand-category ID already exists" });
+    const { brand_id, category_id, sub_category_id, id } = req.body;
+    
+    if (!brand_id || !category_id || !sub_category_id || !id) {
+      return res.status(400).json({ error: 'Brand ID, Category ID, Subcategory ID, and ID are required' });
+    }
 
-    const { rows } = await query(
-      "INSERT INTO brandcategory (id, brand_id, category_id, sub_category_id) VALUES ($1,$2,$3,$4) RETURNING *",
-      [parseInt(id,10), parseInt(brand_id,10), parseInt(category_id,10), parseInt(sub_category_id,10)]
-    );
-    return res.status(201).json({ message: "Brand-category created", brandCategory: rows[0] });
-  } catch (err) {
-    console.error("createBrandCategory:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    // Check if brand category already exists
+    const existingBrandCategory = await brandcategory.findOne({ where: { id } });
+    if (existingBrandCategory) {
+      return res.status(409).json({ error: 'Brand category with this ID already exists' });
+    }
+
+    // Verify that the referenced entities exist
+    const brandExists = await brand.findByPk(brand_id);
+    const categoryExists = await category.findByPk(category_id);
+    const subcategoryExists = await subcategory.findByPk(sub_category_id);
+
+    if (!brandExists) {
+      return res.status(404).json({ error: 'Brand not found' });
+    }
+    if (!categoryExists) {
+      return res.status(404).json({ error: 'Category not found' });
+    }
+    if (!subcategoryExists) {
+      return res.status(404).json({ error: 'Subcategory not found' });
+    }
+
+    const newBrandCategory = await brandcategory.create({ id, brand_id, category_id, sub_category_id });
+    
+    // Fetch the created brand category with associations
+    const createdBrandCategory = await brandcategory.findByPk(newBrandCategory.id, {
+      include: [
+        { model: brand, as: 'brand', attributes: ['brand_id', 'brand_name'] },
+        { model: category, as: 'category', attributes: ['product_category_id', 'category_name'] },
+        { model: subcategory, as: 'subcategory', attributes: ['sub_category_id', 'sub_category_name'] }
+      ]
+    });
+
+    res.status(201).json({ message: 'Brand category created successfully', brandCategory: createdBrandCategory });
+  } catch (error) {
+    console.error('Error creating brand category:', error);
+    res.status(500).json({ error: error.message });
   }
 };
 
 exports.updateBrandCategory = async (req, res) => {
-  const id = parseInt(req.params.id, 10);
-  const { brand_id, category_id, sub_category_id } = req.body;
-  if (!brand_id || !category_id || !sub_category_id)
-    return res.status(400).json({ error: "brand_id, category_id, sub_category_id are required" });
-
   try {
-    const { rows } = await query(
-      `UPDATE brandcategory
-       SET brand_id=$1, category_id=$2, sub_category_id=$3
-       WHERE id=$4 RETURNING *`,
-      [parseInt(brand_id,10), parseInt(category_id,10), parseInt(sub_category_id,10), id]
-    );
-    if (!rows.length) return res.status(404).json({ error: "Brand-category not found" });
-    return res.json({ message: "Brand-category updated", brandCategory: rows[0] });
-  } catch (err) {
-    console.error("updateBrandCategory:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    const { id } = req.params;
+    const { brand_id, category_id, sub_category_id } = req.body;
+
+    if (!brand_id || !category_id || !sub_category_id) {
+      return res.status(400).json({ error: 'Brand ID, Category ID, and Subcategory ID are required' });
+    }
+
+    const brandCategoryToUpdate = await brandcategory.findByPk(id);
+    if (!brandCategoryToUpdate) {
+      return res.status(404).json({ error: 'Brand category not found' });
+    }
+
+    // Verify that the referenced entities exist
+    const brandExists = await brand.findByPk(brand_id);
+    const categoryExists = await category.findByPk(category_id);
+    const subcategoryExists = await subcategory.findByPk(sub_category_id);
+
+    if (!brandExists) {
+      return res.status(404).json({ error: 'Brand not found' });
+    }
+    if (!categoryExists) {
+      return res.status(404).json({ error: 'Category not found' });
+    }
+    if (!subcategoryExists) {
+      return res.status(404).json({ error: 'Subcategory not found' });
+    }
+
+    await brandCategoryToUpdate.update({ brand_id, category_id, sub_category_id });
+    
+    // Fetch updated brand category with associations
+    const updatedBrandCategory = await brandcategory.findByPk(id, {
+      include: [
+        { model: brand, as: 'brand', attributes: ['brand_id', 'brand_name'] },
+        { model: category, as: 'category', attributes: ['product_category_id', 'category_name'] },
+        { model: subcategory, as: 'subcategory', attributes: ['sub_category_id', 'sub_category_name'] }
+      ]
+    });
+
+    res.json({ message: 'Brand category updated successfully', brandCategory: updatedBrandCategory });
+  } catch (error) {
+    console.error('Error updating brand category:', error);
+    res.status(500).json({ error: error.message });
   }
 };
 
 exports.deleteBrandCategory = async (req, res) => {
-  const id = parseInt(req.params.id, 10);
   try {
-    const { rowCount } = await query("DELETE FROM brandcategory WHERE id=$1", [id]);
-    if (!rowCount) return res.status(404).json({ error: "Brand-category not found" });
-    return res.json({ message: "Brand-category deleted" });
-  } catch (err) {
-    console.error("deleteBrandCategory:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    const { id } = req.params;
+
+    const brandCategoryToDelete = await brandcategory.findByPk(id);
+    if (!brandCategoryToDelete) {
+      return res.status(404).json({ error: 'Brand category not found' });
+    }
+
+    await brandCategoryToDelete.destroy();
+    res.json({ message: 'Brand category deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting brand category:', error);
+    res.status(500).json({ error: error.message });
   }
 };

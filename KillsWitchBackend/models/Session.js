@@ -1,29 +1,45 @@
-const { query } = require("../config/db");
+module.exports = (sequelize, DataTypes) => {
+  const Session = sequelize.define('Session', {
+    id: {
+      type: DataTypes.INTEGER,
+      primaryKey: true,
+      autoIncrement: true
+    },
+    userId: {
+      type: DataTypes.INTEGER,
+      allowNull: false
+    },
+    tokenHash: {
+      type: DataTypes.STRING(255),
+      allowNull: false,
+      comment: 'Hash of refresh token'
+    },
+    userAgent: {
+      type: DataTypes.STRING(512),
+      allowNull: true
+    },
+    ipAddress: {
+      type: DataTypes.STRING(64),
+      allowNull: true
+    },
+    expiresAt: {
+      type: DataTypes.DATE,
+      allowNull: false
+    },
+    revokedAt: {
+      type: DataTypes.DATE,
+      allowNull: true
+    }
+  }, {
+    tableName: 'sessions',
+    timestamps: true
+  });
 
-class SessionModel {
-  static async create(userId, tokenHash, userAgent, ipAddress, expiresAt) {
-    await query(
-      `INSERT INTO sessions (user_id, token_hash, user_agent, ip_address, expires_at, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, NOW(), NOW())`,
-      [userId, tokenHash, userAgent.slice(0, 512), ipAddress, expiresAt]
-    );
-  }
+  Session.associate = (models) => {
+    Session.belongsTo(models.User, { foreignKey: 'userId', as: 'user', onDelete: 'CASCADE' });
+  };
 
-  static async findByTokenHash(tokenHash) {
-    const { rows } = await query(
-      `SELECT * FROM sessions WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > NOW()`,
-      [tokenHash]
-    );
-    return rows[0] || null;
-  }
+  return Session;
+};
 
-  static async revokeByUserId(userId) {
-    await query(`UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`, [userId]);
-  }
 
-  static async revokeByTokenHash(tokenHash) {
-    await query(`UPDATE sessions SET revoked_at = NOW() WHERE token_hash = $1`, [tokenHash]);
-  }
-}
-
-module.exports = { SessionModel };

@@ -1,403 +1,446 @@
-"use strict";
-
+const { User, passwordReset, ActivityLog, Session } = require("../models");
 const bcrypt = require("bcrypt");
-const jwt    = require("jsonwebtoken");
-const crypto = require("crypto");
-
-const { query, transaction }         = require("../config/db");
+const jwt = require("jsonwebtoken");
+const crypto = require('crypto');
 const { generateAccessToken, generateRefreshToken, getCookieOptions } = require("../utils/token");
-const { OAuth2Client }               = require("google-auth-library");
-const { sendEmail }                  = require("../utils/email");
-const { otpEmailTemplate }           = require("../utils/emailTemplates");
+const { OAuth2Client } = require("google-auth-library");
+const { sendEmail } = require("../utils/email");
+const { otpEmailTemplate } = require("../utils/emailTemplates");
+const { where } = require("sequelize");
+const { generateState, generateCodeVerifier, Google } = require("arctic");
+const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-const hashToken  = (t)  => crypto.createHash("sha256").update(t).digest("hex");
-const parseUa    = (req)=> (req.headers["user-agent"] || "").slice(0, 512);
-const validEmail = (e)  => typeof e === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
-
-async function createSession(userId, refreshToken, req) {
-  const tokenHash = hashToken(refreshToken);
-  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-  await query(
-    `INSERT INTO sessions (user_id, token_hash, user_agent, ip_address, expires_at, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, NOW(), NOW())`,
-    [userId, tokenHash, parseUa(req), req.ip, expiresAt]
-  );
+function hashToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
 }
 
-// ── Register ──────────────────────────────────────────────────────────────────
+function parseUa(req) {
+  return (req.headers['user-agent'] || '').slice(0, 512);
+}
 
 exports.register = async (req, res) => {
   const { email, password, name, phoneno } = req.body;
-
-  if (!validEmail(email))           return res.status(400).json({ message: "Valid email required" });
-  if (!password || password.length < 8) return res.status(400).json({ message: "Password must be ≥ 8 chars" });
-  if (!name?.trim())                return res.status(400).json({ message: "Name is required" });
-
   try {
-    // Check duplicate — same generic error to prevent enumeration
-    const { rowCount } = await query(
-      "SELECT 1 FROM users WHERE email = $1",
-      [email.toLowerCase()]
-    );
-    if (rowCount > 0) return res.status(400).json({ message: "Registration failed" });
-
-    const hashed = await bcrypt.hash(password, 12);
-
-    const { rows } = await query(
-      `INSERT INTO users (name, email, password, phoneno, role, is_google_auth, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, 'user', false, NOW(), NOW())
-       RETURNING id, email, name, role`,
-      [name.trim(), email.toLowerCase(), hashed, phoneno || null]
-    );
-    const user = rows[0];
-
-    const accessToken  = generateAccessToken(user);
+    const exit = await User.findOne({ where: { email } });
+    if (exit) {
+      return res.status(400).json({ message: "Email already exists" });
+    }
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const user = await User.create({
+      email,
+      password: hashedPassword,
+      name,
+      phoneno,
+    });
+    // Issue tokens & session
+    const accessToken = generateAccessToken(user);
     const refreshToken = generateRefreshToken(user);
-    await createSession(user.id, refreshToken, req);
+    const tokenHash = hashToken(refreshToken);
+    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
 
-    const dur = user.role === "admin" ? 24 * 3600_000 : 7 * 24 * 3600_000;
+    await Session.create({
+      userId: user.id,
+      tokenHash,
+      userAgent: parseUa(req),
+      ipAddress: req.ip,
+      expiresAt
+    });
 
-    // Non-blocking activity log
-    query(
-      `INSERT INTO activity_logs (activity, user_email, details, created_at, updated_at)
-       VALUES ('User Created', $1, $2, NOW(), NOW())`,
-      [user.email, JSON.stringify({ name: user.name, email: user.email })]
-    ).catch(console.error);
-
-    return res
-      .cookie("access_token",  accessToken,  getCookieOptions(dur))
-      .cookie("refresh_token", refreshToken, getCookieOptions(30 * 24 * 3600_000))
+    // Admin sessions last 1 day, regular users 7 days (extended persistence)
+    const accessTokenDuration = user.role === 'admin' ? 24 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
+    
+    res
+      .cookie('access_token', accessToken, getCookieOptions(accessTokenDuration))
+      .cookie('refresh_token', refreshToken, getCookieOptions(30 * 24 * 60 * 60 * 1000))
       .status(201)
-      .json({ message: "User registered", user });
+      .json({ message: "User Register", user: { id: user.id, email: user.email, name: user.name, role: user.role } });
+    const activitylog = await ActivityLog.create({
+      user_email: user.email,
+      activity: "User Created",
+      details: {
+        user_name: user.name,
+        user_phoneno: user.phoneno,
+        email: user.email,
+        timestamp: new Date(),
+      },
+    });
+    console.log(activitylog);
+    // optional: admin notification can be implemented via utils/email
   } catch (err) {
-    console.error("register:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    res.status(500).json({ error: err.message });
   }
 };
-
-// ── Login ─────────────────────────────────────────────────────────────────────
 
 exports.login = async (req, res) => {
   const { email, password } = req.body;
-
-  if (!validEmail(email) || !password)
-    return res.status(401).json({ message: "Invalid credentials" });
-
   try {
-    const { rows } = await query(
-      "SELECT id, email, name, role, password FROM users WHERE email = $1",
-      [email.toLowerCase()]
-    );
-    const user = rows[0];
-
-    // Always run bcrypt to prevent timing-based enumeration
-    const DUMMY = "$2b$12$notarealhashXXXXXXXXXXuDummyHashForTimingProtectionXXX";
-    const match  = await bcrypt.compare(password, user?.password || DUMMY);
-
-    if (!user || !match)
-      return res.status(401).json({ message: "Invalid credentials" });
-
-    const accessToken  = generateAccessToken(user);
-    const refreshToken = generateRefreshToken(user);
-    await createSession(user.id, refreshToken, req);
-
-    const dur = user.role === "admin" ? 24 * 3600_000 : 7 * 24 * 3600_000;
-
-    query(
-      `INSERT INTO activity_logs (activity, user_email, details, created_at, updated_at)
-       VALUES ('User Login', $1, $2, NOW(), NOW())`,
-      [user.email, JSON.stringify({ email: user.email })]
-    ).catch(console.error);
-
-    return res
-      .cookie("access_token",  accessToken,  getCookieOptions(dur))
-      .cookie("refresh_token", refreshToken, getCookieOptions(30 * 24 * 3600_000))
-      .json({ message: "Login successful" });
-    // SECURITY: do not return raw tokens in the body when using httpOnly cookies
-  } catch (err) {
-    console.error("login:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-};
-
-// ── Google Signup ─────────────────────────────────────────────────────────────
-
-exports.googleSignup = async (req, res) => {
-  const { tokenId } = req.body;
-  if (!tokenId) return res.status(400).json({ error: "tokenId required" });
-
-  try {
-    const ticket  = await googleClient.verifyIdToken({ idToken: tokenId, audience: process.env.GOOGLE_CLIENT_ID });
-    const { email, sub: googleId, name } = ticket.getPayload();
-
-    const { rowCount } = await query("SELECT 1 FROM users WHERE email = $1", [email.toLowerCase()]);
-    if (rowCount > 0)
-      return res.status(400).json({ error: "Email already registered. Try logging in." });
-
-    const { rows } = await query(
-      `INSERT INTO users (email, google_id, name, is_google_auth, role, created_at, updated_at)
-       VALUES ($1, $2, $3, true, 'user', NOW(), NOW())
-       RETURNING id, email, name, role`,
-      [email.toLowerCase(), googleId, name]
-    );
-    const user = rows[0];
-
-    const accessToken  = generateAccessToken(user);
-    const refreshToken = generateRefreshToken(user);
-    await createSession(user.id, refreshToken, req);
-
-    return res
-      .cookie("access_token",  accessToken,  getCookieOptions(15 * 60_000))
-      .cookie("refresh_token", refreshToken, getCookieOptions(30 * 24 * 3600_000))
-      .status(201)
-      .json({ message: "Signup successful" });
-  } catch (err) {
-    console.error("googleSignup:", err.message);
-    return res.status(500).json({ error: "Google signup failed" });
-  }
-};
-
-// ── Refresh ───────────────────────────────────────────────────────────────────
-
-exports.refresh = async (req, res) => {
-  const provided = req.body?.refreshToken || req.cookies?.refresh_token;
-  if (!provided) return res.status(401).json({ error: "Refresh token required" });
-
-  try {
-    let payload;
-    try { payload = jwt.verify(provided, process.env.REFRESH_TOKEN_SECRET); }
-    catch { return res.status(403).json({ error: "Invalid or expired token" }); }
-
-    const tokenHash = hashToken(provided);
-    const { rows }  = await query(
-      `SELECT * FROM sessions
-       WHERE user_id = $1 AND token_hash = $2 AND revoked_at IS NULL AND expires_at > NOW()`,
-      [payload.id, tokenHash]
-    );
-    if (!rows.length) return res.status(403).json({ error: "Session invalid or expired" });
-
-    // Rotate: revoke old session
-    await query("UPDATE sessions SET revoked_at = NOW() WHERE token_hash = $1", [tokenHash]);
-
-    const { rows: userRows } = await query(
-      "SELECT id, email, role FROM users WHERE id = $1",
-      [payload.id]
-    );
-    if (!userRows.length) return res.status(403).json({ error: "User not found" });
-    const user = userRows[0];
-
-    const newAccess  = generateAccessToken(user);
-    const newRefresh = generateRefreshToken(user);
-    await createSession(user.id, newRefresh, req);
-
-    return res
-      .cookie("access_token",  newAccess,  getCookieOptions(15 * 60_000))
-      .cookie("refresh_token", newRefresh, getCookieOptions(30 * 24 * 3600_000))
-      .json({ message: "Token refreshed" });
-  } catch (err) {
-    console.error("refresh:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-};
-
-// ── Logout ────────────────────────────────────────────────────────────────────
-
-exports.logout = async (req, res) => {
-  try {
-    const provided = req.body?.refreshToken || req.cookies?.refresh_token;
-    if (provided) {
-      await query(
-        "UPDATE sessions SET revoked_at = NOW() WHERE token_hash = $1",
-        [hashToken(provided)]
-      );
+    const user = await User.findOne({ where: { email } });
+    if (!user) {
+      return res.status(400).json({ message: "User not found" });
     }
-    return res.clearCookie("access_token").clearCookie("refresh_token").json({ success: true });
-  } catch (err) {
-    console.error("logout:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-};
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(401).json({ message: "Invalid password" });
+    }
+    const accessToken = generateAccessToken(user);
+    const refreshToken = generateRefreshToken(user);
+    const tokenHash = hashToken(refreshToken);
+    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
 
-exports.logoutAll = async (req, res) => {
-  try {
-    if (!req.user?.id) return res.status(401).json({ error: "Unauthorized" });
-    await query(
-      "UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL",
-      [req.user.id]
-    );
-    return res.clearCookie("access_token").clearCookie("refresh_token").json({ success: true });
-  } catch (err) {
-    console.error("logoutAll:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-};
-
-// ── Forgot / Reset Password ───────────────────────────────────────────────────
-
-exports.forgePassword = async (req, res) => {
-  const { email } = req.body;
-  if (!validEmail(email)) return res.status(400).json({ message: "Valid email required" });
-
-  const GENERIC = { message: "If that email is registered, an OTP has been sent." };
-
-  try {
-    const { rows } = await query("SELECT id, email FROM users WHERE email = $1", [email.toLowerCase()]);
-    if (!rows.length) return res.json(GENERIC);   // silent – no enumeration
-
-    const otp      = String(crypto.randomInt(100_000, 999_999));
-    const expireAt = new Date(Date.now() + 10 * 60_000);
-
-    await query(
-      `INSERT INTO password_resets (email, otp, expire_at, created_at, updated_at)
-       VALUES ($1, $2, $3, NOW(), NOW())`,
-      [email.toLowerCase(), otp, expireAt]
-    );
-
-    const from             = process.env.SMTP_FROM || process.env.SMTP_USER;
-    const { subject, html } = otpEmailTemplate({ otp, appName: "Killswitch", validityMinutes: 10 });
-    await sendEmail(from, email, subject, html);
-
-    return res.json(GENERIC);
-  } catch (err) {
-    console.error("forgePassword:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-};
-
-exports.verifyOtp = async (req, res) => {
-  const { email, otp } = req.body;
-  if (!validEmail(email) || !otp) return res.status(400).json({ error: "Email and OTP required" });
-
-  try {
-    const { rows } = await query(
-      `SELECT * FROM password_resets
-       WHERE email = $1 AND otp = $2 AND expire_at > NOW()
-       ORDER BY created_at DESC LIMIT 1`,
-      [email.toLowerCase(), String(otp)]
-    );
-    if (!rows.length) return res.status(400).json({ error: "Invalid or expired OTP" });
-    return res.json({ message: "OTP verified" });
-  } catch (err) {
-    console.error("verifyOtp:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-};
-
-exports.resetPassword = async (req, res) => {
-  const { email, password } = req.body;
-  if (!validEmail(email) || !password || password.length < 8)
-    return res.status(400).json({ message: "Valid email and password (≥8 chars) required" });
-
-  try {
-    const { rows } = await query(
-      "SELECT id FROM users WHERE email = $1",
-      [email.toLowerCase()]
-    );
-    if (!rows.length) return res.status(404).json({ message: "User not found" });
-
-    const hashed = await bcrypt.hash(password, 12);
-
-    await transaction(async (tx) => {
-      await tx("UPDATE users SET password = $1, updated_at = NOW() WHERE email = $2", [hashed, email.toLowerCase()]);
-      await tx("DELETE FROM password_resets WHERE email = $1", [email.toLowerCase()]);
-      // Revoke all sessions so old tokens can't be reused
-      await tx("UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL", [rows[0].id]);
+    await Session.create({
+      userId: user.id,
+      tokenHash,
+      userAgent: parseUa(req),
+      ipAddress: req.ip,
+      expiresAt
     });
 
-    query(
-      `INSERT INTO activity_logs (activity, user_email, details, created_at, updated_at)
-       VALUES ('Password Reset', $1, $2, NOW(), NOW())`,
-      [email.toLowerCase(), JSON.stringify({ email, timestamp: new Date() })]
-    ).catch(console.error);
-
-    return res.json({ message: "Password reset successfully" });
+    // Admin sessions last 1 day, regular users 7 days (extended persistence)
+    const accessTokenDuration = user.role === 'admin' ? 24 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
+    
+    res
+      .cookie('access_token', accessToken, getCookieOptions(accessTokenDuration))
+      .cookie('refresh_token', refreshToken, getCookieOptions(30 * 24 * 60 * 60 * 1000))
+      .json({ accessToken, refreshToken });
+    await ActivityLog.create({
+      user_email: user.email,
+      activity: "User Login",
+      details: {
+        user_name: user.name,
+        email: user.email,
+        timestamp: new Date(),
+      },
+    });
   } catch (err) {
-    console.error("resetPassword:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    res.status(500).json({ message: err.message || 'Login error' });
   }
 };
 
-// ── Profile ───────────────────────────────────────────────────────────────────
+// exports.googleLogin = async (req, res) => {
+//   const { tokenId } = req.body;
 
+//   try {
+//     const ticket = await client.verifyIdToken({
+//       idToken: tokenId,
+//       audience: process.env.GOOGLE_CLIENT_ID,
+//     });
+
+//     const { email, sub: googleId } = ticket.getPayload();
+
+//     const user = await User.findOne({
+//       where: {
+//         [Op.or]: [
+//           { email },
+//           { googleId }
+//         ]
+//       }
+//     });
+
+//     if (user && !user.isGoogleAuth) {
+//       return res.status(403).json({
+//         error: 'Email registered with password. Use email login instead.'
+//       });
+//     }
+
+//     if (!user) {
+//       const { name } = ticket.getPayload();
+//       const newUser = await User.create({
+//         email,
+//         googleId,
+//         name,
+//         isGoogleAuth: true,
+//         password: null
+//       });
+//       return res.status(201).json({ newUser});
+//     }
+
+//     const accessToken = generateAccessToken(user);
+//     console.log(accessToken);
+
+//   } catch (err) {
+//     res.status(401).json({ error: err.message });
+//   }
+// };
+exports.googleSignup = async (req, res) => {
+  const { tokenId } = req.body;
+
+  try {
+    const ticket = await client.verifyIdToken({
+      idToken: tokenId,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+
+    const { email, sub: googleId, name } = ticket.getPayload();
+
+    const existingUser = await User.findOne({ where: { email } });
+    if (existingUser) {
+      return res.status(400).json({
+        error: "Email already registered. Try logging in instead.",
+      });
+    }
+
+    const newUser = await User.create({
+      email,
+      googleId,
+      name,
+      isGoogleAuth: true,
+      password: null,
+    });
+
+    const accessToken = generateAccessToken(newUser);
+    const refreshToken = generateRefreshToken(newUser);
+    const tokenHash = hashToken(refreshToken);
+    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
+    await Session.create({ userId: newUser.id, tokenHash, userAgent: parseUa(req), ipAddress: req.ip, expiresAt });
+
+    res
+      .cookie('access_token', accessToken, getCookieOptions(15 * 60 * 1000))
+      .cookie('refresh_token', refreshToken, getCookieOptions(30 * 24 * 60 * 60 * 1000))
+      .redirect(`${process.env.WEB_ORIGIN}?token=${accessToken}`);
+  } catch (err) {
+    res.status(500).json({
+      error: "Google signup failed",
+      details: err.message,
+    });
+  }
+};
+
+// Refresh access & refresh tokens with rotation
+exports.refresh = async (req, res) => {
+  try {
+    const provided = (req.body && req.body.refreshToken) || (req.cookies && req.cookies.refresh_token);
+    if (!provided) return res.status(401).json({ error: 'Refresh token required' });
+
+    const payload = jwt.verify(provided, process.env.REFRESH_TOKEN_SECRET);
+    const tokenHash = hashToken(provided);
+
+    const session = await Session.findOne({ where: { userId: payload.id, tokenHash, revokedAt: null } });
+    if (!session) return res.status(403).json({ error: 'Invalid session' });
+    if (new Date(session.expiresAt) < new Date()) return res.status(403).json({ error: 'Session expired' });
+
+    // Rotate: revoke old, create new
+    session.revokedAt = new Date();
+    await session.save();
+
+    const user = await User.findByPk(payload.id);
+    const newAccess = generateAccessToken(user);
+    const newRefresh = generateRefreshToken(user);
+    const newHash = hashToken(newRefresh);
+    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    await Session.create({ userId: user.id, tokenHash: newHash, userAgent: parseUa(req), ipAddress: req.ip, expiresAt });
+
+    return res
+      .cookie('access_token', newAccess, getCookieOptions(15 * 60 * 1000))
+      .cookie('refresh_token', newRefresh, getCookieOptions(30 * 24 * 60 * 60 * 1000))
+      .json({ accessToken: newAccess, refreshToken: newRefresh });
+  } catch (err) {
+    return res.status(403).json({ error: err.message });
+  }
+};
+
+// Logout current session
+exports.logout = async (req, res) => {
+  try {
+    const provided = (req.body && req.body.refreshToken) || (req.cookies && req.cookies.refresh_token);
+    if (!provided) return res.status(200).clearCookie('access_token').clearCookie('refresh_token').json({ success: true });
+
+    const tokenHash = hashToken(provided);
+    await Session.update({ revokedAt: new Date() }, { where: { tokenHash } });
+    return res
+      .clearCookie('access_token')
+      .clearCookie('refresh_token')
+      .json({ success: true });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+// Logout all sessions for user
+exports.logoutAll = async (req, res) => {
+  try {
+    const userId = req.user && req.user.id;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+    await Session.update({ revokedAt: new Date() }, { where: { userId, revokedAt: null } });
+    return res.clearCookie('access_token').clearCookie('refresh_token').json({ success: true });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+};
+exports.forgePassword = async (req, res) => {
+  const { email } = req.body;
+  try {
+    const user = await User.findOne({ where: { email } });
+    if (!user) {
+      return res.status(404).json({ err: " User Not Found" });
+    }
+
+    const otp = Math.floor(10000 + Math.random() * 90000);
+    const ExpireAt = new Date(Date.now() + 10 * 60 * 1000);
+    console.log({
+      email,
+      otp: otp,
+      otpType: typeof otp.toString(),
+      expireAt: ExpireAt,
+    });
+
+    await passwordReset.create({
+      email,
+      otp: otp.toString(),
+      expireAt: ExpireAt,
+    });
+    const fromAddress =
+      process.env.SMTP_FROM ||
+      process.env.EMAIL_FROM ||
+      process.env.email_from ||
+      process.env.SMTP_USER ||
+      process.env.EMAIL_USER ||
+      process.env.email_user;
+
+    const { subject, html } = otpEmailTemplate({ otp, appName: "Killswitch", validityMinutes: 10 });
+
+    await sendEmail(fromAddress, email, subject, html);
+    res.json({
+      message: "OTP sent to  email",
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+exports.verifyOtp = async (req, res) => {
+  const { email, otp } = req.body;
+  try {
+    const record = await passwordReset.findOne({
+      where: { email, otp },
+      order: [["createdAt", "DESC"]],
+    });
+    if (!otp) {
+      return res.status(404).json({ err: " OTP Not Found" });
+    }
+    if (!record || new Date() > record.expireAt) {
+      return res.status(400).json({ error: " OTP  Expired" });
+    }
+    if (record.otp !== otp) {
+      return res.status(400).json({ error: "Invalid OTP" });
+    }
+    res.status(200).json({ message: "OTP Verified" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+exports.resetPassword = async (req, res) => {
+  const { email, password } = req.body;
+  try {
+    const user = await User.findOne({ where: { email } });
+    if (!user) {
+      return res.status(404).json({ err: " User Not Found" });
+    }
+    const hashedPassword = await bcrypt.hash(password, 10);
+    user.password = hashedPassword;
+    await user.save();
+    await passwordReset.destroy({ where: { email: email } });
+    res.json({ message: "Password Reset Successfully" });
+    await ActivityLog.create({
+      user_email: user.email,
+      activity: "Password Reset",
+      details: {
+        user: user.email,
+        timestamp: new Date(),
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// return profile with additional fields read from database
 exports.getProfile = async (req, res) => {
   try {
-    const { rows } = await query(
-      "SELECT id, email, name, phoneno, role, same_shipping_billing_default FROM users WHERE id = $1",
-      [req.user.id]
-    );
-    if (!rows.length) return res.status(404).json({ message: "User not found" });
-    return res.json({ user: rows[0] });
+    const user = await User.findByPk(req.user.id, {
+      attributes: ['id','email','name','phoneno','role','sameShippingBillingDefault']
+    });
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    return res.json({ user });
   } catch (err) {
-    console.error("getProfile:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    return res.status(500).json({ error: err.message });
   }
 };
 
+// allow logged in user to update their own name/email/phone
 exports.updateProfile = async (req, res) => {
   const { name, email, phoneno, password, sameShippingBillingDefault } = req.body;
   try {
-    const { rows } = await query("SELECT * FROM users WHERE id = $1", [req.user.id]);
-    if (!rows.length) return res.status(404).json({ message: "User not found" });
-
-    const user = rows[0];
-    // Build dynamic SET clause — only update provided fields
-    const updates = [];
-    const vals    = [];
-    let   i       = 1;
-
-    if (name  !== undefined) { updates.push(`name = $${i++}`);   vals.push(name.trim()); }
-    if (phoneno !== undefined){ updates.push(`phoneno = $${i++}`);vals.push(phoneno); }
-    if (sameShippingBillingDefault !== undefined) {
-      updates.push(`same_shipping_billing_default = $${i++}`);
-      vals.push(!!sameShippingBillingDefault);
+    const user = await User.findByPk(req.user.id);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
     }
-    if (email !== undefined && email !== user.email) {
-      if (!validEmail(email)) return res.status(400).json({ message: "Invalid email" });
-      const { rowCount } = await query("SELECT 1 FROM users WHERE email = $1 AND id != $2", [email.toLowerCase(), req.user.id]);
-      if (rowCount > 0) return res.status(400).json({ message: "Email already in use" });
-      updates.push(`email = $${i++}`); vals.push(email.toLowerCase());
-    }
+    if (name !== undefined) user.name = name;
+    if (email !== undefined) user.email = email;
+    if (phoneno !== undefined) user.phoneno = phoneno;
+    if (sameShippingBillingDefault !== undefined) user.sameShippingBillingDefault = sameShippingBillingDefault;
     if (password) {
-      if (password.length < 8) return res.status(400).json({ message: "Password too short" });
-      updates.push(`password = $${i++}`); vals.push(await bcrypt.hash(password, 12));
+      const bcrypt = require('bcrypt');
+      user.password = await bcrypt.hash(password, 10);
     }
-
-    if (!updates.length) return res.json({ success: true, message: "Nothing to update" });
-
-    updates.push(`updated_at = NOW()`);
-    vals.push(req.user.id);
-
-    const { rows: updated } = await query(
-      `UPDATE users SET ${updates.join(", ")} WHERE id = $${i} RETURNING id, email, name, phoneno, role`,
-      vals
-    );
-    return res.json({ success: true, user: updated[0] });
+    await user.save();
+    return res.json({ success: true, user: { id: user.id, email: user.email, name: user.name, phoneno: user.phoneno, role: user.role, sameShippingBillingDefault: user.sameShippingBillingDefault } });
   } catch (err) {
-    console.error("updateProfile:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    return res.status(500).json({ error: err.message });
   }
 };
 
 exports.updateUserRole = async (req, res) => {
   const { email, newRole } = req.body;
-  const ALLOWED = ["admin", "user"];
 
-  if (!email || !newRole)             return res.status(400).json({ message: "email and newRole required" });
-  if (!ALLOWED.includes(newRole))     return res.status(400).json({ message: "Invalid role" });
+  if (!email || !newRole) {
+    return res.status(400).json({ message: "Email and newRole are required" });
+  }
+
+  // only allow the two roles we support
+  const allowedRoles = ["admin", "user"];
+  if (!allowedRoles.includes(newRole)) {
+    return res.status(400).json({ message: "Invalid role specified" });
+  }
 
   try {
-    const { rows } = await query(
-      "UPDATE users SET role = $1, updated_at = NOW() WHERE email = $2 RETURNING id, email, role",
-      [newRole, email.toLowerCase()]
-    );
-    if (!rows.length) return res.status(404).json({ message: "User not found" });
-    return res.json({ success: true, user: rows[0] });
+    const user = await User.findOne({ where: { email } });
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    user.role = newRole;
+    await user.save();
+
+    return res.json({
+      success: true,
+      message: `User role updated to '${newRole}' successfully.`,
+      user: {
+        id: user.id,
+        email: user.email,
+        role: user.role,
+      },
+    });
   } catch (err) {
-    console.error("updateUserRole:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    return res
+      .status(500)
+      .json({
+        success: false,
+        message: "Internal server error",
+        error: err.message,
+      });
   }
 };
+// exports.getGoogleLoginPage = async(req,res)=>{
+//   if(req.user) return res.redirect("/");
+//   const state = generateState();
+//   const codeVerifier = generateCodeVerifier();
+//   const url = google.createAuthorizationURL(state, codeVerifier, [
+//     "openid",
+//     "profile",
+//     "email",
+
+//   ])
+// }
