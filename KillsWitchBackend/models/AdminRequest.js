@@ -34,5 +34,19 @@ module.exports = (sequelize, DataTypes) => {
     }
   );
 
+  // AdminRequest.associate = (models) => {
+  //   AdminRequest.hasMany(models.Order, {
+  //     foreignKey: "adminRequestId",
+  //     sourceKey: "admin_request_id",
+  //     as: "order",
+  //   });
+
+  //   AdminRequest.hasMany(models.User, {
+  //     foreignKey: "adminRequestId",
+  //     sourceKey: "user_email",
+  //     as: "user",
+  //   });
+  // };
+
   return AdminRequest;
 };

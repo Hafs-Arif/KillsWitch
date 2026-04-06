@@ -13,8 +13,11 @@ module.exports = (sequelize, DataTypes) => {
         }
     });
 
-    brand.associate = (models) => {
-            brand.hasMany(models.brandcategory, { foreignKey: 'brand_id', as: 'brandcategory' });
-    };
-    return brand;
-}
+brand.associate = (models) => {
+        brand.hasMany(models.brandcategory, { foreignKey: 'brand_id', as: 'brandcategory' });
+ };
+
+    
+          
+        return brand;
+    }
