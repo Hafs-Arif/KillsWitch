@@ -18,7 +18,7 @@ const { query, transaction } = require("./config/db");
 const configurePassport = require("./config/passport");
 const { setupSocket }   = require("./socket");
 const messageCleanupService = require("./services/messageCleanupService");
-const { initializeDatabase } = require("./config/initDb");
+// const { initializeDatabase } = require("./config/initDb");
 const { generateAccessToken, generateRefreshToken, getCookieOptions } = require("./utils/token");
 
 // ── Routes (Fixed Typos) ─────────────────────────────────────────────────────
@@ -219,7 +219,7 @@ async function start() {
   try {
     // Initialize database schema
     console.log("Starting application...");
-    await initializeDatabase();
+    // await initializeDatabase();
     
     setupSocket(server);
     messageCleanupService.start();
