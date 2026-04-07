@@ -48,7 +48,7 @@ exports.findAllProducts = async (req, res) => {
         {
           model: Review,
           as: "reviews",
-          attributes: ["id", "rating", "title", "comment", "reviewer_name", "createdAt"],
+          attributes: ["id", "rating", "comment", "reviewer_name", "createdAt"],
           required: false
         },
       ],
@@ -199,7 +199,7 @@ exports.findProductById = async (req, res) => {
         {
           model: Review,
           as: "reviews",
-          attributes: ["id", "rating", "title", "comment", "reviewer_name", "createdAt"],
+          attributes: ["id", "rating", "comment", "reviewer_name", "createdAt"],
           required: false
         },
       ],

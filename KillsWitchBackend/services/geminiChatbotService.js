@@ -46,7 +46,7 @@ class DeepSeekChatbotService {
           {
             model: Review,
             as: "reviews",
-            attributes: ["id", "rating", "title", "comment", "reviewer_name"],
+            attributes: ["id", "rating", "comment", "reviewer_name"],
             required: false
           },
         ],
