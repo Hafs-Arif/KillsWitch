@@ -2,305 +2,327 @@
 
 module.exports = {
   up: async (queryInterface, Sequelize) => {
+    // Get existing columns
+    const table = await queryInterface.describeTable('products');
+    
+    // Helper function to add column safely
+    const addColumnIfNotExists = async (columnName, definition) => {
+      if (!table[columnName]) {
+        await queryInterface.addColumn('products', columnName, definition);
+      }
+    };
+
     // Add new specification columns to products table
-    await queryInterface.addColumn('products', 'product_model', {
+    await addColumnIfNotExists('product_model', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'motherboard', {
+    await addColumnIfNotExists('motherboard', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'material', {
+    await addColumnIfNotExists('material', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'front_ports', {
+    await addColumnIfNotExists('front_ports', {
       type: Sequelize.TEXT,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'gpu_length', {
+    await addColumnIfNotExists('gpu_length', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'cpu_height', {
+    await addColumnIfNotExists('cpu_height', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'hdd_support', {
+    await addColumnIfNotExists('hdd_support', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'ssd_support', {
+    await addColumnIfNotExists('ssd_support', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'expansion_slots', {
+    await addColumnIfNotExists('expansion_slots', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'case_size', {
+    await addColumnIfNotExists('case_size', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'water_cooling_support', {
+    await addColumnIfNotExists('water_cooling_support', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'case_fan_support', {
+    await addColumnIfNotExists('case_fan_support', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'carton_size', {
+    await addColumnIfNotExists('carton_size', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'loading_capacity', {
+    await addColumnIfNotExists('loading_capacity', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
     // Pump specs
-    await queryInterface.addColumn('products', 'pump_parameter', {
+    await addColumnIfNotExists('pump_parameter', {
       type: Sequelize.TEXT,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'pump_bearing', {
+    await addColumnIfNotExists('pump_bearing', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'pump_speed', {
+    await addColumnIfNotExists('pump_speed', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'pump_interface', {
+    await addColumnIfNotExists('pump_interface', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'pump_noise', {
+    await addColumnIfNotExists('pump_noise', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'tdp', {
+    await addColumnIfNotExists('tdp', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'pipe_length_material', {
+    await addColumnIfNotExists('pipe_length_material', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'light_effect', {
+    await addColumnIfNotExists('light_effect', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'drainage_size', {
+    await addColumnIfNotExists('drainage_size', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
     // Fan specs
-    await queryInterface.addColumn('products', 'fan_size', {
+    await addColumnIfNotExists('fan_size', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'fan_speed', {
+    await addColumnIfNotExists('fan_speed', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'fan_voltage', {
+    await addColumnIfNotExists('fan_voltage', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'fan_interface', {
+    await addColumnIfNotExists('fan_interface', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'fan_airflow', {
+    await addColumnIfNotExists('fan_airflow', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'fan_wind_pressure', {
+    await addColumnIfNotExists('fan_wind_pressure', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'fan_noise', {
+    await addColumnIfNotExists('fan_noise', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'fan_bearing_type', {
+    await addColumnIfNotExists('fan_bearing_type', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'fan_power', {
+    await addColumnIfNotExists('fan_power', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'fan_rated_voltage', {
+    await addColumnIfNotExists('fan_rated_voltage', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
     // Keyboard specs
-    await queryInterface.addColumn('products', 'axis', {
+    await addColumnIfNotExists('axis', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'number_of_keys', {
+    await addColumnIfNotExists('number_of_keys', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'weight', {
+    await addColumnIfNotExists('weight', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'carton_weight', {
+    await addColumnIfNotExists('carton_weight', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'package_size', {
+    await addColumnIfNotExists('package_size', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'carton_size_kb', {
+    await addColumnIfNotExists('carton_size_kb', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'keycap_technology', {
+    await addColumnIfNotExists('keycap_technology', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'wire_length', {
+    await addColumnIfNotExists('wire_length', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'lighting_style', {
+    await addColumnIfNotExists('lighting_style', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'body_material', {
+    await addColumnIfNotExists('body_material', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
     // Mouse specs
-    await queryInterface.addColumn('products', 'dpi', {
+    await addColumnIfNotExists('dpi', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'return_rate', {
+    await addColumnIfNotExists('return_rate', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'engine_solution', {
+    await addColumnIfNotExists('engine_solution', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'surface_technology', {
+    await addColumnIfNotExists('surface_technology', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
     // Packaging & Customization
-    await queryInterface.addColumn('products', 'package', {
+    await addColumnIfNotExists('package', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'packing', {
+    await addColumnIfNotExists('packing', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'moq_customization', {
+    await addColumnIfNotExists('moq_customization', {
       type: Sequelize.STRING,
       allowNull: true
     });
 
-    await queryInterface.addColumn('products', 'customization_options', {
+    await addColumnIfNotExists('customization_options', {
       type: Sequelize.TEXT,
       allowNull: true
     });
 
     // Create ProductImages table
-    await queryInterface.createTable('ProductImages', {
-      id: {
-        allowNull: false,
-        autoIncrement: true,
-        primaryKey: true,
-        type: Sequelize.INTEGER
-      },
-      url: {
-        type: Sequelize.STRING,
-        allowNull: false
-      },
-      productId: {
-        type: Sequelize.INTEGER,
-        allowNull: false,
-        references: {
-          model: 'products',
-          key: 'product_id'
+    try {
+      await queryInterface.createTable('ProductImages', {
+        id: {
+          allowNull: false,
+          autoIncrement: true,
+          primaryKey: true,
+          type: Sequelize.INTEGER
         },
-        onUpdate: 'CASCADE',
-        onDelete: 'CASCADE'
-      },
-      createdAt: {
-        allowNull: false,
-        type: Sequelize.DATE
-      },
-      updatedAt: {
-        allowNull: false,
-        type: Sequelize.DATE
+        url: {
+          type: Sequelize.STRING,
+          allowNull: false
+        },
+        productId: {
+          type: Sequelize.INTEGER,
+          allowNull: false,
+          references: {
+            model: 'products',
+            key: 'product_id'
+          },
+          onUpdate: 'CASCADE',
+          onDelete: 'CASCADE'
+        },
+        createdAt: {
+          allowNull: false,
+          type: Sequelize.DATE
+        },
+        updatedAt: {
+          allowNull: false,
+          type: Sequelize.DATE
+        }
+      });
+    } catch (error) {
+      if (!error.message.includes('already exists')) {
+        throw error;
       }
-    });
+    }
   },
 
   down: async (queryInterface, Sequelize) => {
-    // Drop ProductImages table
-    await queryInterface.dropTable('ProductImages');
+    const table = await queryInterface.describeTable('products');
+    
+    // Drop ProductImages table if it exists
+    try {
+      await queryInterface.dropTable('ProductImages');
+    } catch (error) {
+      // Table might not exist
+    }
 
-    // Remove all the added columns
+    // Remove all the added columns if they exist
     const columnsToRemove = [
       'product_model', 'motherboard', 'material', 'front_ports', 'gpu_length',
       'cpu_height', 'hdd_support', 'ssd_support', 'expansion_slots', 'case_size',
@@ -316,7 +338,13 @@ module.exports = {
     ];
 
     for (const column of columnsToRemove) {
-      await queryInterface.removeColumn('products', column);
+      if (table[column]) {
+        try {
+          await queryInterface.removeColumn('products', column);
+        } catch (error) {
+          // Column might not exist
+        }
+      }
     }
   }
 };
