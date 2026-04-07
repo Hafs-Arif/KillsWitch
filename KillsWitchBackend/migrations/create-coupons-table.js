@@ -2,6 +2,17 @@
 
 module.exports = {
   up: async (queryInterface, Sequelize) => {
+    try {
+      // Check if coupons table already exists
+      const tables = await queryInterface.showAllTables();
+      if (tables.includes('coupons') || tables.includes('Coupons')) {
+        console.log('Coupons table already exists, skipping creation');
+        return;
+      }
+    } catch (error) {
+      // Continue with creation if check fails
+    }
+
     await queryInterface.createTable('coupons', {
       id: {
         allowNull: false,

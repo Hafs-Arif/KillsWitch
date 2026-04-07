@@ -2,6 +2,17 @@
 
 module.exports = {
   up: async (queryInterface, Sequelize) => {
+    try {
+      // Check if carts table already exists
+      const tables = await queryInterface.showAllTables();
+      if (tables.includes('carts')) {
+        console.log('carts table already exists, skipping creation');
+        return;
+      }
+    } catch (error) {
+      // Continue with creation if check fails
+    }
+
     // Create carts table
     await queryInterface.createTable('carts', {
       id: {

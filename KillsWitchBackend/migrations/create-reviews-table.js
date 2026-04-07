@@ -2,6 +2,17 @@
 
 module.exports = {
   up: async (queryInterface, Sequelize) => {
+    try {
+      // Check if reviews table already exists
+      const tables = await queryInterface.showAllTables();
+      if (tables.includes('reviews')) {
+        console.log('reviews table already exists, skipping creation');
+        return;
+      }
+    } catch (error) {
+      // Continue with creation if check fails
+    }
+
     await queryInterface.createTable('reviews', {
       id: {
         allowNull: false,
